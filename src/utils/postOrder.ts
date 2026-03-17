@@ -12,9 +12,9 @@ const COPY_STRATEGY_CONFIG = ENV.COPY_STRATEGY_CONFIG;
 const TRADE_MULTIPLIER = ENV.TRADE_MULTIPLIER;
 const COPY_PERCENTAGE = ENV.COPY_PERCENTAGE;
 
-// Polymarket minimum order sizes
-const MIN_ORDER_SIZE_USD = 1.0; // Minimum order size in USD for BUY orders
-const MIN_ORDER_SIZE_TOKENS = 1.0; // Minimum order size in tokens for SELL/MERGE orders
+// Minimum order sizes - read from config (set MIN_ORDER_SIZE_USD in .env)
+const MIN_ORDER_SIZE_USD = COPY_STRATEGY_CONFIG.minOrderSizeUSD;
+const MIN_ORDER_SIZE_TOKENS = COPY_STRATEGY_CONFIG.minOrderSizeUSD;
 
 const extractOrderError = (response: unknown): string | undefined => {
     if (!response) {
