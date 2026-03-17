@@ -1,325 +1,395 @@
 # Polymarket 做市策略算法报告
 
-> 本报告基于 @mrryanchi 分享的做市策略线索，结合 Polymarket 官方文档、开源实现及市场分析，整理而成。
->
-> **数据来源：**
-> - [Polymarket 官方做市策略文章](https://news.polymarket.com/p/automated-market-making-on-polymarket)
-> - [Phemex：Polymarket 稳定做市策略](https://phemex.com/news/article/polymarkets-strategy-for-stable-market-making-43240)
-> - [预测市场做市完全指南 2026](https://newyorkcityservers.com/blog/prediction-market-making-guide)
-> - [开源实现 poly-maker](https://github.com/warproxxx/poly-maker)
+> **理论基础：** *Toward Black-Scholes for Prediction Markets* (Shaw Dalen, arxiv 2510.15205)
+> **参考来源：** Polymarket 官方文档、poly-maker 开源实现、Phemex 市场分析
+> **生成时间：** 2026-03-17 | 分支：claude/market-making-strategy-report-BHFYX
 
 ---
 
-## 一、策略核心思想
+## 一、论文核心理论
 
-Polymarket 做市策略的本质是**低波动 + 高奖励市场的流动性套利**，核心盈利来源有两块：
+### 1.1 核心思想
 
-| 盈利来源 | 说明 |
+传统预测市场缺乏系统性的期权定价框架。论文提出将 **Black-Scholes** 体系迁移到预测市场，构建统一的做市定价模型。
+
+**关键洞察：** 预测市场价格在 **logit（对数几率）空间**中表现出与金融市场类似的随机性，因此可以套用相同的随机过程建模工具。
+
+### 1.2 Logit 跳跃-扩散随机过程
+
+论文提出的核心随机过程：
+
+```
+对数几率变换：
+  x(t) = log[p(t) / (1 - p(t))]   ← 将概率映射到 (-∞, +∞)
+
+随机过程（混合模型）：
+  dx = σ dW + J dN(λ)
+
+其中：
+  σ dW  = 连续扩散项（信念的渐进演化）
+  J dN(λ) = 跳跃项（离散信息冲击，如新闻事件）
+  σ = 信念波动率（belief volatility）
+  λ = 跳跃强度（jumps/day）
+  J = 跳跃幅度（服从正态分布 N(μ_j, σ_j²)）
+```
+
+**直觉解释：**
+- 没有新信息时，市场概率在当前位置附近随机漂移（扩散）
+- 当重大新闻发布时，概率发生离散跳跃（跳跃）
+- 做市商的核心任务：根据 σ 和 λ 动态调整报价价差
+
+### 1.3 日历效应（Calendar Effect）
+
+论文特别指出预测市场的独特日历效应：
+
+```
+临近结算时，价格必然收敛至 0 或 1（确定性）
+
+时间因子：τ = 剩余天数 / 市场总存续天数 ∈ [0, 1]
+
+效应：
+  - τ → 1（市场初期）：不确定性高，价差自然宽
+  - τ → 0（临近结算）：虽然不确定性已解析，但价格可能剧烈波动
+                         → 价差反而应该扩大（做市商风险补偿）
+
+日历乘数 = 1 + (1 - τ)³ × calendar_factor
+```
+
+### 1.4 EM 算法参数估计
+
+论文使用 **期望最大化（EM）算法**分离扩散和跳跃成分，过滤微观结构噪声：
+
+```
+输入：价格时间序列 p[0..n]
+
+Step 1: 转换到 logit 空间
+  x[i] = log(p[i] / (1 - p[i]))
+
+Step 2: 计算对数收益
+  r[i] = x[i] - x[i-1]  (时间间隔 dt[i])
+
+Step 3: EM 迭代
+  E-step: 对每个 r[i] 计算跳跃后验概率
+    P(jump | r[i]) = π × N(r[i]; μ_j, σ_j²) / 总密度
+    P(no jump | r[i]) = (1-π) × N(r[i]; 0, σ²·dt[i]) / 总密度
+
+  M-step: 更新参数
+    π     ← 平均跳跃概率
+    σ     ← 非跳跃收益的扩散波动率
+    μ_j   ← 跳跃均值
+    σ_j   ← 跳跃方差
+    λ = π / mean(dt)
+
+Step 4: 公平价值估计
+  x_fair = EMA(logit(prices), α=0.3)
+  p_fair = logistic(x_fair)
+```
+
+---
+
+## 二、做市定价算法
+
+### 2.1 综合定价公式
+
+融合 Stoikov 库存模型 + 论文三因子风险框架：
+
+```
+报价计算步骤：
+
+1. 归一化库存
+   q = net_position_USD / max_inventory  ∈ [-1, +1]
+
+2. 动态价差乘数（论文三因子）
+   spread_mult = 1 + γ·q² + β·σ² + ζ·λ
+     γ = 库存风险厌恶系数（默认 0.2）
+     β = 信念波动率敏感度（默认 1.0）
+     ζ = 跳跃强度敏感度（默认 0.5）
+
+3. 日历乘数
+   τ = days_to_resolution / total_duration
+   calendar_mult = 1 + (1-τ)³ × 2.0
+
+4. 半价差
+   half_spread = (base_spread/2) × spread_mult × calendar_mult
+   half_spread = min(half_spread, max_spread/2)
+
+5. 库存偏斜中间价（Stoikov）
+   adjusted_mid = fair_value - γ · σ² · q
+   （持有过多 YES → 压低中间价 → 促进卖出）
+
+6. 最终报价
+   bid = clamp(adjusted_mid - half_spread, 0.01, 0.99)
+   ask = clamp(adjusted_mid + half_spread, 0.01, 0.99)
+```
+
+### 2.2 数值示例
+
+假设：p_fair=0.50, σ=0.04, λ=0.5, q=0.3（轻度超买）
+
+```
+spread_mult = 1 + 0.2×0.09 + 1.0×0.0016 + 0.5×0.5
+            = 1 + 0.018 + 0.0016 + 0.25
+            = 1.270
+
+τ=0.8（市场还有 80% 剩余时间）
+calendar_mult = 1 + (0.2)³ × 2.0 = 1.016
+
+half_spread = (0.02/2) × 1.270 × 1.016 = 0.01288
+
+adjusted_mid = 0.50 - 0.2 × 0.0016 × 0.3 = 0.4999
+
+bid = 0.4999 - 0.0129 = 0.487
+ask = 0.4999 + 0.0129 = 0.513
+价差 = 0.026（2.6分）
+```
+
+### 2.3 市场评分公式
+
+```
+风险调整收益评分：
+  score = daily_reward_estimate / (σ × max(λ, 0.01))
+
+daily_reward_estimate = reward_pool × market_share
+  market_share = 2 × capital × proximity / (liquidity + 2 × capital × proximity)
+  proximity = max(0, 1 - half_spread / 0.05)
+
+按 score 降序选择前 MM_MARKET_LIMIT 个市场
+```
+
+---
+
+## 三、两层市场筛选框架
+
+### 第一层：量化筛选
+
+| 条件 | 阈值 | 说明 |
+|------|------|------|
+| 价格区间 | [0.10, 0.90] | 排除近确定性市场 |
+| 距结算天数 | > 7 天 | 避免临近结算风险 |
+| 市场存续 | > 14 天 | 有足够价格历史用于EM |
+| 奖励池 | > 0 | 有流动性激励才有正期望 |
+
+### 第二层：质量护盾（人工/规则排除）
+
+- 政治/法律风险高的市场（结果可能存在争议）
+- 规则定义模糊的市场
+- 内幕交易迹象（巨鲸主导、单边异常流量）
+- 选举类市场（2024年后奖励锐减）
+
+---
+
+## 四、库存管理与风险控制
+
+### 4.1 库存限制与偏斜
+
+```
+单市场限制:
+  最大净头寸 = MM_MAX_INVENTORY_PER_MARKET（默认 $500）
+  总敞口上限 = MM_MAX_TOTAL_INVENTORY（默认 $3,000）
+
+订单大小缩减（基于归一化库存 q）：
+  bid_scale = max(0.25, 1 - max(0, q))    ← 偏多时减少买单
+  ask_scale = max(0.25, 1 - max(0, -q))   ← 偏空时减少卖单
+  bid_size = base_order_size × bid_scale
+  ask_size = base_order_size × ask_scale
+```
+
+### 4.2 熔断机制（Circuit Breaker）
+
+| 触发条件 | 响应 |
 |---------|------|
-| **买卖价差（Spread）** | 同时挂 YES 买单和 YES 卖单，赚取中间差价 |
-| **流动性奖励（Liquidity Rewards）** | Polymarket 每日向双边挂单者发放 USDC 奖励 |
+| 60 秒内价格变动 > 5% | 撤单 + 暂停 5 分钟 |
+| 当日该市场亏损 > $200 | 撤单 + 暂停 24 小时 |
+| 距结算 < 1 天 | 撤单，不再参与 |
 
-**关键洞察：** 双边挂单相比单边挂单可获得 **近 3 倍** 的流动性奖励，且挂单越靠近当前价格，奖励越高。这使得做市的预期收益可以远超单纯的方向性博弈。
+### 4.3 临近结算处理
 
----
-
-## 二、双层市场筛选框架
-
-策略采用"机器理性 + 认知护盾"两层过滤机制：
-
-### 第一层：机器理性（量化筛选）
-
-```
-筛选条件（全部满足方可入选）：
-  ✓ 过去 14 天价格波动最小（低波动率）
-  ✓ 当前价格区间在 0.10 ~ 0.90 之间（排除极端概率市场）
-  ✓ 市场深度 > $10,000 USDC（有足够流动性缓冲冲击）
-  ✓ 每日奖励池 > 1.00 USDC（最低盈利门槛）
-  ✓ 结算周期在 15 ~ 90 天之间（避免即将结算的高风险市场）
-```
-
-### 第二层：认知护盾（人工排除）
-
-```
-排除条件（任意满足则剔除）：
-  ✗ 高政治/法律风险（结果模糊）
-  ✗ 市场规则存在歧义
-  ✗ 存在内幕交易迹象（巨鲸主导、异常成交）
-  ✗ 选举类市场（高度不确定，2024年后奖励锐减）
-```
+| 剩余时间 | 策略 |
+|---------|------|
+| > 30 天 | 正常做市 |
+| 15-30 天 | 价差 × 1.5 倍（calendar_mult 自动处理） |
+| 7-15 天 | 价差 × 2 倍，降低库存上限 50% |
+| < 7 天 | 停止新开仓 |
+| < 1 天 | 全部撤单 |
 
 ---
 
-## 三、报价定价算法
+## 五、流动性奖励优化
 
-### 3.1 基础报价模型
-
-基于 **Stoikov 模型**改编，用于在二元市场（YES/NO）中计算最优挂单价：
+Polymarket 奖励采用二次方评分（Quadratic Scoring）：
 
 ```
-公式：
-  Mid Price (P_mid)  = 市场当前中间价（取最优买一/卖一均值）
+奖励公式：
+  daily_reward ≈ pool × (your_score / total_score)
 
-  Ask Price (P_ask)  = P_mid + spread/2 + γ × σ² × q × T
-  Bid Price (P_bid)  = P_mid - spread/2 + γ × σ² × q × T
+your_score = Σ [size_i × proximity_i × time_fraction_i]
 
-参数说明：
-  γ   = 风险厌恶系数（建议值 0.1 ~ 0.5）
-  σ²  = 价格方差（用历史滚动窗口估计，建议 3h/24h/7d 多周期加权）
-  q   = 当前库存净头寸（正值 = 持有 YES，负值 = 持有 NO）
-  T   = 距结算剩余时间（以天为单位）
-```
-
-**核心逻辑：** 当你持有过多 YES 头寸时（q > 0），报价向上偏移（提高卖出意愿，降低买入意愿），主动引导市场减少你的库存风险。
-
-### 3.2 自适应价差（Adaptive Spread）
-
-根据市场流动性动态调整价差宽度：
-
-```python
-def calculate_spread(volatility_24h, market_depth, base_spread=0.02):
-    """
-    volatility_24h: 过去24小时价格标准差
-    market_depth:   市值深度（USD）
-    base_spread:    基础价差（默认 2 美分）
-    """
-    # 波动率调整：波动越大，价差越宽
-    vol_multiplier = 1 + (volatility_24h / 0.05)  # 以5%波动为基准
-
-    # 深度调整：市场越浅，价差越宽（风险补偿）
-    depth_multiplier = max(1.0, 10000 / market_depth)
-
-    spread = base_spread * vol_multiplier * depth_multiplier
-
-    # 价差上限控制（避免过宽导致无成交）
-    return min(spread, 0.08)  # 最宽 8 美分
-```
-
-### 3.3 多时间框架波动率估计
-
-```
-volatility_score = w1 × σ_3h + w2 × σ_24h + w3 × σ_7d + w4 × σ_30d
-
-推荐权重：
-  w1 = 0.40  (3小时，反映即时波动)
-  w2 = 0.30  (24小时)
-  w3 = 0.20  (7天)
-  w4 = 0.10  (30天，长期背景)
-
-市场分类：
-  低波动  ≤ 0.03  → 紧价差 (0.02~0.03)
-  中波动  ≤ 0.07  → 标准价差 (0.03~0.05)
-  高波动  > 0.07  → 宽价差 (0.05~0.08) 或暂停做市
-```
-
----
-
-## 四、库存管理算法
-
-库存风险是做市最大威胁。一旦市场单边运动，做市商会被迫持有大量亏损头寸。
-
-### 4.1 库存限制
-
-```
-每个市场最大净头寸：$500 USDC（相当于初始资金的 5%）
-全部市场总敞口上限：$3,000 USDC
-
-触发对冲条件：
-  |净头寸| > $300 → 开始报价偏斜（倾向减仓方向）
-  |净头寸| > $500 → 暂停新增加仓方向的挂单
-  |净头寸| > $700 → 触发强制平仓（市价减仓）
-```
-
-### 4.2 报价偏斜（Quote Skewing）
-
-```python
-def skew_quotes(bid, ask, inventory, max_inventory=500):
-    """
-    根据库存方向偏移报价，引导市场平衡库存
-    """
-    skew_factor = inventory / max_inventory  # -1 到 +1
-
-    # 持有过多 YES（inventory > 0）→ 压低买价、提高卖价（促进卖出）
-    bid_skewed = bid - skew_factor * 0.01
-    ask_skewed = ask - skew_factor * 0.01
-
-    return bid_skewed, ask_skewed
-```
-
-### 4.3 临近结算风险处理
-
-```
-距结算日期   → 处理策略
-> 30 天      正常做市
-15~30 天     将价差扩大 1.5 倍
-7~15 天      将价差扩大 2 倍，降低库存上限至 50%
-< 7 天       停止新开仓，仅维持现有订单或主动平仓
-< 1 天       全部撤单，不再参与
-```
-
----
-
-## 五、流动性奖励最大化
-
-Polymarket 的奖励公式采用 **二次方评分（Quadratic Scoring）**，倾向于奖励更紧密且持续的双边报价。
-
-### 5.1 奖励估算公式
-
-```
-daily_reward ≈ pool_reward × (your_score / total_score)
-
-your_score = Σ [size_i × proximity_score_i × time_fraction_i]
-
-proximity_score = max(0, 1 - |P_order - P_mid| / max_distance)
-  其中 max_distance = 0.05（距中间价超过5%则不计分）
+proximity = max(0, 1 - |order_price - mid| / 0.05)
+  (距中间价超过 5% 则不得分)
 
 关键结论：
-  双边挂单奖励系数 ≈ 3 × 单边挂单奖励系数
-  挂单距中间价每增加 1%，奖励下降约 20%
-```
-
-### 5.2 资本分配策略
-
-```
-目标：最大化 reward_per_dollar_deployed
-
-资本分配优先级（按 risk_adjusted_reward 排序）：
-  risk_adjusted_reward = daily_reward_estimate / (volatility × depth_risk)
-
-建议分配：
-  前 3 名市场：每市场 $2,000
-  4~8 名市场：每市场 $500
-  总部署上限：$10,000
+  ✓ 双边挂单 ≈ 单边挂单奖励的 3 倍
+  ✓ 离中间价每增加 1%，奖励降约 20%
+  ✓ postOnly 保证纯 maker 身份，避免 taker 手续费
 ```
 
 ---
 
-## 六、事件风险防护（Circuit Breaker）
+## 六、系统架构与代码结构
 
-### 6.1 自动熔断条件
-
-```
-触发条件                          → 响应措施
--------------------------------------------------------------------
-价格在 60 秒内变动 > 5%           撤销全部挂单，暂停 5 分钟
-24 小时亏损 > $200               暂停该市场 24 小时
-异常成交量（> 10× 均值）         扩大价差 3 倍
-接入新闻 API 检测到重大事件       全市场暂停报价
-```
-
-### 6.2 新闻 API 集成
-
-```python
-class EventRiskMonitor:
-    """
-    监控可能影响预测市场的突发事件
-    """
-    RISK_KEYWORDS = [
-        "breaking", "confirmed", "ruling", "verdict",
-        "result", "official", "announces", "wins"
-    ]
-
-    def should_pause_market(self, market_title: str, news_feed: list) -> bool:
-        """
-        检查是否有与市场相关的突发新闻，如有则暂停做市
-        """
-        for article in news_feed[-50:]:  # 检查最近50条新闻
-            if any(kw in article['title'].lower() for kw in self.RISK_KEYWORDS):
-                if self._is_related(market_title, article):
-                    return True
-        return False
-```
-
----
-
-## 七、整体执行流程
+### 6.1 新增文件
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                    做市机器人主循环                        │
-│                  （每 30 秒执行一次）                      │
-└─────────────────────────────────────────────────────────┘
-         │
-         ▼
-┌─────────────────────┐
-│ 1. 市场数据采集      │  拉取价格、深度、历史波动率、奖励池数据
-└─────────────────────┘
-         │
-         ▼
-┌─────────────────────┐
-│ 2. 市场评分排名      │  按 risk_adjusted_reward 排序
-└─────────────────────┘
-         │
-         ▼
-┌─────────────────────┐
-│ 3. 风险检查          │  检查库存、熔断条件、新闻事件
-└─────────────────────┘
-         │ 通过
-         ▼
-┌─────────────────────┐
-│ 4. 定价计算          │  Stoikov 模型 + 自适应价差 + 库存偏斜
-└─────────────────────┘
-         │
-         ▼
-┌─────────────────────┐
-│ 5. 订单管理          │  撤销失效订单 → 按新价格重新挂单
-└─────────────────────┘
-         │
-         ▼
-┌─────────────────────┐
-│ 6. 绩效追踪          │  记录 PnL、奖励收益、价差收益
-└─────────────────────┘
-         │
-         ▼ 等待 30 秒后重复
+src/
+├── models/
+│   └── marketMakingState.ts     # MongoDB 数据模型（价格历史/订单/库存/市场）
+├── utils/
+│   ├── jumpDiffusionModel.ts    # 论文核心算法（EM 参数估计）
+│   └── marketMakingPricer.ts    # 报价定价（Stoikov + 三因子）
+└── services/
+    ├── marketMakingMonitor.ts   # 市场扫描/评分（每 5 分钟）
+    └── marketMakingExecutor.ts  # 报价更新主循环（每 30 秒）
+```
+
+### 6.2 修改文件
+
+| 文件 | 改动 |
+|------|------|
+| `src/config/env.ts` | 新增 `BOT_MODE` + `MarketMakingConfig` 解析 |
+| `src/index.ts` | 根据 `BOT_MODE` 启动不同服务 |
+| `.env.example` | 补充全部 MM 配置变量文档 |
+
+### 6.3 数据流
+
+```
+[Polymarket Data API]          [CLOB API]
+  markets list                  order book prices
+       │                              │
+       ▼                              ▼
+┌─────────────────────────────────────────────────┐
+│           marketMakingMonitor（每5分钟）          │
+│  - 拉取市场列表                                   │
+│  - 双层筛选                                       │
+│  - 拉取价格历史 → 存 mm_price_history             │
+│  - EM估计 σ, λ                                   │
+│  - 计算 risk_adjusted_score                       │
+│  - 更新 mm_markets（top N active=true）           │
+└─────────────────────────────────────────────────┘
+                          │ MongoDB
+                          ▼
+┌─────────────────────────────────────────────────┐
+│         marketMakingExecutor（每30秒）            │
+│  - 读 mm_markets（active=true, sort by score）   │
+│  - 对每个市场：                                   │
+│    ① 拉取实时 mid price                          │
+│    ② EM 估计 → computeQuotes()                  │
+│    ③ 熔断检查                                    │
+│    ④ shouldReprice() → 是否需要更新               │
+│    ⑤ cancelMarketOrders() + 2x placeGTCOrder()   │
+│  - 定期 reconcileFilledOrders()更新库存           │
+└─────────────────────────────────────────────────┘
+                          │
+                          ▼
+              [Polymarket CLOB - GTC 限价单]
 ```
 
 ---
 
-## 八、绩效基准与预期收益
+## 七、三种运行模式
 
-基于 $10,000 起始资金的历史参考数据：
+通过 `BOT_MODE` 环境变量控制：
 
-| 指标 | 入门期 | 成熟期 |
-|------|--------|--------|
-| 日均收益 | $150 ~ $200 | $500 ~ $800 |
-| 价差收益占比 | ~30% | ~40% |
-| 奖励收益占比 | ~70% | ~60% |
-| 最大日亏损 | -$300 | -$500 |
-| 平均参与市场数 | 5 ~ 8 个 | 15 ~ 25 个 |
-| 策略夏普比率 | 1.5 ~ 2.5 | — |
+### COPY（默认）
+保持原有 Copy Trading 功能，不启动做市模块。
 
-> ⚠️ **风险提示：** 2024 年大选后 Polymarket 大幅削减流动性奖励，当前盈利空间已收窄。
-> 开源 poly-maker 作者明确表示"当前市场环境下该策略亏损"，建议将其作为参考实现。
+### MARKET_MAKING
+仅运行做市引擎，适合专注流动性提供的场景：
+- 自动扫描市场、挂双边 GTC 限价单
+- 赚取买卖价差 + 流动性奖励
+
+### HYBRID（推荐进阶用户）
+同时运行两个引擎，实现**策略协同**：
+
+```
+协同效应（信号融合）：
+  Copy Trading → 识别聪明钱方向
+  Market Making → 在该方向的市场双边挂单
+
+具体机制：
+  - 聪明钱大量买 YES → adjusted_mid 上移 → ask 更高（高价卖出）
+  - 做市在已跟单的市场同时挂单 → 额外获取流动性奖励
+  - 降低总持仓成本（用奖励收益补贴 Copy Trading 滑点）
+```
 
 ---
 
-## 九、与现有 Copy Trading Bot 的集成建议
+## 八、预期绩效与风险提示
 
-本项目当前为 Copy Trading Bot，可考虑以下集成路径：
+### 收益预期（$10,000 本金，20 个市场）
 
+| 来源 | 日均估算 |
+|------|---------|
+| 价差收益（bid-ask capture） | $50 ~ $150 |
+| 流动性奖励（USDC rewards） | $100 ~ $300 |
+| **合计** | **$150 ~ $450 / 天** |
+
+> 数据基于奖励削减后（2025年后）的保守估计
+
+### 主要风险
+
+| 风险 | 缓解措施 |
+|------|---------|
+| 信息不对称（逆向选择）| postOnly 模式 + 跳跃检测熔断 |
+| 库存积累 | 双边缩减订单 + 最大净头寸限制 |
+| 市场突变 | 价格变动 >5% 触发熔断 |
+| 结算风险 | 7 天前停止新开仓 |
+| 奖励削减 | score 排序自动过滤低奖励市场 |
+
+### 重要提示
+
+> ⚠️ **2024 年大选后 Polymarket 大幅削减流动性奖励**
+> 当前单纯依赖奖励的策略盈利能力已显著降低。
+> HYBRID 模式（结合 Copy Trading）可通过多元化收益来源提高整体盈利能力。
+> 建议先用少量资金（每市场 $10~$20）验证 GTC 挂单流程后再加大规模。
+
+---
+
+## 九、快速启动
+
+### 做市模式
+
+```bash
+# 在 .env 中设置
+BOT_MODE=MARKET_MAKING
+MM_BASE_CAPITAL=1000          # 从小资金开始
+MM_ORDER_SIZE_USD=10           # 每笔挂单 $10
+MM_MAX_INVENTORY_PER_MARKET=100
+MM_POST_ONLY=true              # 只做 maker
+
+npm run dev
 ```
-方案 A：并行模式（推荐）
-  - Copy Trading 负责方向性头寸（跟随聪明钱）
-  - Market Making 负责已持仓市场的双边流动性（降低持仓成本）
 
-方案 B：信号增强
-  - 将聪明钱持仓偏向作为 Stoikov 模型的 P_mid 偏移信号
-  - 如目标 trader 持有大量 YES → P_mid 上移 → 做市方向偏多
+### 混合模式
 
-方案 C：奖励套利
-  - 纯粹以获取流动性奖励为目的
-  - 选择 Copy Trading 未覆盖的低波动市场独立做市
+```bash
+# 在 .env 中保持原有 copy trading 配置，并添加：
+BOT_MODE=HYBRID
+MM_ORDER_SIZE_USD=50
+MM_MARKET_LIMIT=10
+
+npm run dev
 ```
 
 ---
 
 ## 十、参考资料
 
+- [arxiv 2510.15205 – Toward Black-Scholes for Prediction Markets](https://arxiv.org/pdf/2510.15205)
 - [Polymarket 官方：Automated Market Making on Polymarket](https://news.polymarket.com/p/automated-market-making-on-polymarket)
+- [Polymarket CLOB L2 Methods 文档](https://docs.polymarket.com/developers/CLOB/clients/methods-l2)
 - [Phemex：Polymarket's Stable Market Making Strategy](https://phemex.com/news/article/polymarkets-strategy-for-stable-market-making-43240)
-- [NYC Servers：Market Making on Prediction Markets Complete 2026 Guide](https://newyorkcityservers.com/blog/prediction-market-making-guide)
 - [GitHub：warproxxx/poly-maker](https://github.com/warproxxx/poly-maker)
-- [Polymarket CLOB Docs](https://docs.polymarket.com/market-makers/overview)
+- [NYC Servers：Market Making on Prediction Markets Complete 2026 Guide](https://newyorkcityservers.com/blog/prediction-market-making-guide)
 
 ---
 

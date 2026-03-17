@@ -322,6 +322,71 @@ const parseCopyStrategy = (): CopyStrategyConfig => {
     return config;
 };
 
+/** Valid bot operation modes */
+export type BotMode = 'COPY' | 'MARKET_MAKING' | 'HYBRID';
+
+/** Parse and validate BOT_MODE */
+const parseBotMode = (): BotMode => {
+    const raw = (process.env.BOT_MODE || 'COPY').toUpperCase();
+    if (raw === 'COPY' || raw === 'MARKET_MAKING' || raw === 'HYBRID') {
+        return raw as BotMode;
+    }
+    throw new Error(`Invalid BOT_MODE: "${process.env.BOT_MODE}". Must be COPY, MARKET_MAKING, or HYBRID.`);
+};
+
+/** Market-making specific configuration */
+export interface MarketMakingConfig {
+    baseSpread: number;
+    maxSpread: number;
+    baseCapital: number;
+    maxInventoryPerMarket: number;
+    maxTotalInventory: number;
+    marketLimit: number;
+    rebalanceIntervalSec: number;
+    // Paper risk factors
+    riskAversion: number;
+    volSensitivity: number;
+    jumpSensitivity: number;
+    calendarFactor: number;
+    // Market filter
+    priceRangeMin: number;
+    priceRangeMax: number;
+    minMarketAgeDays: number;
+    minDaysToResolution: number;
+    // Order settings
+    postOnly: boolean;
+    repriceThreshold: number;
+    orderSizeUSD: number;
+    maxDailyLoss: number;
+    // EM algorithm
+    priceHistoryWindowHours: number;
+    emMaxIterations: number;
+}
+
+const parseMarketMakingConfig = (): MarketMakingConfig => ({
+    baseSpread: parseFloat(process.env.MM_BASE_SPREAD || '0.02'),
+    maxSpread: parseFloat(process.env.MM_MAX_SPREAD || '0.08'),
+    baseCapital: parseFloat(process.env.MM_BASE_CAPITAL || '10000'),
+    maxInventoryPerMarket: parseFloat(process.env.MM_MAX_INVENTORY_PER_MARKET || '500'),
+    maxTotalInventory: parseFloat(process.env.MM_MAX_TOTAL_INVENTORY || '3000'),
+    marketLimit: parseInt(process.env.MM_MARKET_LIMIT || '20', 10),
+    rebalanceIntervalSec: parseInt(process.env.MM_REBALANCE_INTERVAL || '30', 10),
+    riskAversion: parseFloat(process.env.MM_RISK_AVERSION || '0.2'),
+    volSensitivity: parseFloat(process.env.MM_VOL_SENSITIVITY || '1.0'),
+    jumpSensitivity: parseFloat(process.env.MM_JUMP_SENSITIVITY || '0.5'),
+    calendarFactor: parseFloat(process.env.MM_CALENDAR_FACTOR || '2.0'),
+    priceRangeMin: parseFloat(process.env.MM_PRICE_RANGE_MIN || '0.10'),
+    priceRangeMax: parseFloat(process.env.MM_PRICE_RANGE_MAX || '0.90'),
+    minMarketAgeDays: parseInt(process.env.MM_MIN_MARKET_AGE_DAYS || '14', 10),
+    minDaysToResolution: parseInt(process.env.MM_MIN_DAYS_TO_RESOLUTION || '7', 10),
+    postOnly: process.env.MM_POST_ONLY !== 'false',
+    repriceThreshold: parseFloat(process.env.MM_REPRICE_THRESHOLD || '0.005'),
+    orderSizeUSD: parseFloat(process.env.MM_ORDER_SIZE_USD || '100'),
+    maxDailyLoss: parseFloat(process.env.MM_MAX_DAILY_LOSS || '200'),
+    priceHistoryWindowHours: parseInt(process.env.MM_PRICE_HISTORY_WINDOW_HOURS || '168', 10),
+    emMaxIterations: parseInt(process.env.MM_EM_MAX_ITERATIONS || '50', 10),
+});
+
 export const ENV = {
     USER_ADDRESSES: parseUserAddresses(process.env.USER_ADDRESSES as string),
     PROXY_WALLET: process.env.PROXY_WALLET as string,
@@ -348,4 +413,7 @@ export const ENV = {
     MONGO_URI: process.env.MONGO_URI as string,
     RPC_URL: process.env.RPC_URL as string,
     USDC_CONTRACT_ADDRESS: process.env.USDC_CONTRACT_ADDRESS as string,
+    // Bot mode & market making
+    BOT_MODE: parseBotMode(),
+    MARKET_MAKING: parseMarketMakingConfig(),
 };

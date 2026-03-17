@@ -3,6 +3,8 @@ import { ENV } from './config/env';
 import createClobClient from './utils/createClobClient';
 import tradeExecutor, { stopTradeExecutor } from './services/tradeExecutor';
 import tradeMonitor, { stopTradeMonitor } from './services/tradeMonitor';
+import marketMakingMonitor, { stopMarketMakingMonitor } from './services/marketMakingMonitor';
+import marketMakingExecutor, { stopMarketMakingExecutor } from './services/marketMakingExecutor';
 import Logger from './utils/logger';
 import { performHealthCheck, logHealthCheck } from './utils/healthCheck';
 
@@ -26,6 +28,8 @@ const gracefulShutdown = async (signal: string) => {
         // Stop services
         stopTradeMonitor();
         stopTradeExecutor();
+        stopMarketMakingMonitor();
+        stopMarketMakingExecutor();
 
         // Give services time to finish current operations
         Logger.info('Waiting for services to finish current operations...');
@@ -90,12 +94,23 @@ export const main = async () => {
         const clobClient = await createClobClient();
         Logger.success('CLOB client ready');
 
+        const mode = ENV.BOT_MODE;
         Logger.separator();
-        Logger.info('Starting trade monitor...');
-        tradeMonitor();
+        Logger.info(`Bot mode: ${mode}`);
 
-        Logger.info('Starting trade executor...');
-        tradeExecutor(clobClient);
+        if (mode === 'COPY' || mode === 'HYBRID') {
+            Logger.info('Starting trade monitor...');
+            tradeMonitor();
+            Logger.info('Starting trade executor...');
+            tradeExecutor(clobClient);
+        }
+
+        if (mode === 'MARKET_MAKING' || mode === 'HYBRID') {
+            Logger.info('Starting market making monitor...');
+            await marketMakingMonitor();
+            Logger.info('Starting market making executor...');
+            marketMakingExecutor(clobClient);
+        }
 
         // test(clobClient);
     } catch (error) {
