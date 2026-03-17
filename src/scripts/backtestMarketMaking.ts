@@ -788,9 +788,10 @@ async function main() {
                 startDate: entry.startDate ? new Date(entry.startDate) : new Date(Date.now() - 30 * 86400000),
             };
 
+            const cutoffTs = Math.floor(Date.now() / 1000) - CFG.days * 86400;
             const ticks: PriceTick[] = (entry.history || []).map(h => ({ t: h.t, p: h.p }));
             const filteredTicks = ticks.filter(
-                (t) => t.p >= CFG.priceRangeMin && t.p <= CFG.priceRangeMax
+                (t) => t.t >= cutoffTs && t.p >= CFG.priceRangeMin && t.p <= CFG.priceRangeMax
             );
 
             process.stdout.write(
