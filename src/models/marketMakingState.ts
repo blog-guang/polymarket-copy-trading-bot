@@ -127,8 +127,12 @@ export interface IMMMarket extends Document {
     daysToResolution: number;
     rewardPool: number;       // estimated daily USDC reward pool
     score: number;            // risk-adjusted reward score
-    sigma: number;            // belief volatility (EM estimate)
-    lambda: number;           // jump intensity (EM estimate)
+    sigma: number;            // belief volatility (hybrid EM estimate)
+    lambda: number;           // jump intensity (hourly EM estimate)
+    /** Volatility regime: CALM | NORMAL | VOLATILE | EXTREME */
+    regime: string;
+    /** Directional trend signal in [-1, +1] from linear regression on logit prices */
+    trend: number;
     active: boolean;
     lastScored: Date;
 }
@@ -147,6 +151,8 @@ const MMMarketSchema = new Schema<IMMMarket>(
         score: { type: Number, default: 0 },
         sigma: { type: Number, default: 0.01 },
         lambda: { type: Number, default: 0.01 },
+        regime: { type: String, default: 'NORMAL', index: true },
+        trend: { type: Number, default: 0 },
         active: { type: Boolean, default: true, index: true },
         lastScored: { type: Date, default: Date.now },
     },

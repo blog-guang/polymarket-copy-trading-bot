@@ -15,7 +15,12 @@ import { ClobClient, Side, OrderType } from '@polymarket/clob-client';
 import { ENV } from '../config/env';
 import Logger from '../utils/logger';
 import fetchData from '../utils/fetchData';
-import { estimateJumpDiffusion } from '../utils/jumpDiffusionModel';
+import {
+    estimateParamsHybrid,
+    classifyRegime,
+    detectTrend,
+    VolatilityRegime,
+} from '../utils/jumpDiffusionModel';
 import {
     computeQuotes,
     computeOrderSizes,
@@ -293,7 +298,7 @@ async function updateQuotesForMarket(
 
     const { mid: currentPrice } = book;
 
-    // 2. Load price history & run EM
+    // 2. Load price history & run hybrid EM (σ from 1-min, λ from hourly)
     const { prices, timestamps } = await loadRecentPrices(market.conditionId);
 
     // Append current price to history snapshot (in-memory only for EM)
@@ -301,8 +306,23 @@ async function updateQuotesForMarket(
     const allTs = [...timestamps, Date.now()];
 
     const { sigma, lambda, fairValue } = allPrices.length >= 5
-        ? estimateJumpDiffusion(allPrices, allTs, MM_CFG.emMaxIterations)
+        ? estimateParamsHybrid(allPrices, allTs)
         : { sigma: 0.05, lambda: 0.1, fairValue: currentPrice };
+
+    // Classify regime and apply hard σ cutoff
+    const regime: VolatilityRegime = classifyRegime(sigma);
+    if (regime === 'EXTREME' || sigma >= MM_CFG.maxSigma) {
+        Logger.warning(
+            `[MM Executor] Skipping ${market.question?.slice(0, 40)} — σ=${sigma.toFixed(3)} (EXTREME)`
+        );
+        await cancelMarketOrders(clobClient, market.conditionId);
+        return;
+    }
+
+    // Detect trend
+    const trend = allPrices.length >= 4
+        ? detectTrend(allPrices, allTs, 6)
+        : (market.trend ?? 0);
 
     // 3. Get inventory
     const inv = await getInventory(market.conditionId, market.tokenIdYes);
@@ -315,23 +335,33 @@ async function updateQuotesForMarket(
         return;
     }
 
-    // 5. Compute quotes
+    // 5. Compute quotes (regime-aware)
     const totalDuration = market.marketAge + market.daysToResolution;
     const quotes = computeQuotes({
         fairValue,
         sigma,
         lambda,
+        regime,
+        trend,
         netPosition: inv.netPosition * inv.avgEntryPrice,
         maxInventory: MM_CFG.maxInventoryPerMarket,
         baseSpread: MM_CFG.baseSpread,
+        calmBaseSpread: MM_CFG.calmBaseSpread,
         maxSpread: MM_CFG.maxSpread,
         riskAversion: MM_CFG.riskAversion,
         volSensitivity: MM_CFG.volSensitivity,
         jumpSensitivity: MM_CFG.jumpSensitivity,
+        trendThreshold: MM_CFG.trendThreshold,
         daysToResolution: market.daysToResolution,
         totalMarketDuration: totalDuration > 0 ? totalDuration : 90,
         calendarFactor: MM_CFG.calendarFactor,
     });
+
+    // Regime gate (redundant safety check — computeQuotes returns null for EXTREME)
+    if (!quotes) {
+        await cancelMarketOrders(clobClient, market.conditionId);
+        return;
+    }
 
     // 6. Check existing open orders
     const openOrders = await getOpenOrdersForMarket(clobClient, market.conditionId);
@@ -351,15 +381,21 @@ async function updateQuotesForMarket(
     // 7. Cancel and re-place
     await cancelMarketOrders(clobClient, market.conditionId);
 
-    const { bidSize, askSize } = computeOrderSizes(MM_CFG.orderSizeUSD, quotes.normalizedInventory);
+    const { bidSize, askSize } = computeOrderSizes(
+        MM_CFG.orderSizeUSD,
+        quotes.normalizedInventory,
+        regime,
+        trend,
+        MM_CFG.trendThreshold
+    );
 
     const bidId = await placeGTCOrder(clobClient, market, 'BUY', quotes.bid, bidSize);
     const askId = await placeGTCOrder(clobClient, market, 'SELL', quotes.ask, askSize);
 
     Logger.info(
-        `[MM] ${market.question?.slice(0, 30)}… | ` +
-        `σ=${sigma.toFixed(3)} λ=${lambda.toFixed(2)} | ` +
-        `bid=${quotes.bid.toFixed(3)} ask=${quotes.ask.toFixed(3)} | ` +
+        `[MM] ${market.question?.slice(0, 28)}… | ` +
+        `${regime} σ=${sigma.toFixed(3)} λ=${lambda.toFixed(2)} trend=${trend.toFixed(2)} | ` +
+        `bid=${quotes.bid.toFixed(3)} ask=${quotes.ask.toFixed(3)} spread=${(quotes.halfSpread * 2).toFixed(3)} | ` +
         `inv=${quotes.normalizedInventory.toFixed(2)} | ` +
         `bidId=${bidId?.slice(0, 8) ?? 'FAIL'} askId=${askId?.slice(0, 8) ?? 'FAIL'}`
     );

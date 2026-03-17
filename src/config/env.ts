@@ -337,6 +337,8 @@ const parseBotMode = (): BotMode => {
 /** Market-making specific configuration */
 export interface MarketMakingConfig {
     baseSpread: number;
+    /** Tighter base spread used in CALM volatility regime */
+    calmBaseSpread: number;
     maxSpread: number;
     baseCapital: number;
     maxInventoryPerMarket: number;
@@ -353,6 +355,8 @@ export interface MarketMakingConfig {
     priceRangeMax: number;
     minMarketAgeDays: number;
     minDaysToResolution: number;
+    /** Hard σ cutoff — markets with sigma >= maxSigma are excluded (EXTREME regime gate) */
+    maxSigma: number;
     // Order settings
     postOnly: boolean;
     repriceThreshold: number;
@@ -361,10 +365,14 @@ export interface MarketMakingConfig {
     // EM algorithm
     priceHistoryWindowHours: number;
     emMaxIterations: number;
+    // Trend detection
+    /** |trend| threshold above which one-sided quoting activates */
+    trendThreshold: number;
 }
 
 const parseMarketMakingConfig = (): MarketMakingConfig => ({
     baseSpread: parseFloat(process.env.MM_BASE_SPREAD || '0.02'),
+    calmBaseSpread: parseFloat(process.env.MM_CALM_SPREAD || '0.01'),
     maxSpread: parseFloat(process.env.MM_MAX_SPREAD || '0.08'),
     baseCapital: parseFloat(process.env.MM_BASE_CAPITAL || '10000'),
     maxInventoryPerMarket: parseFloat(process.env.MM_MAX_INVENTORY_PER_MARKET || '500'),
@@ -379,12 +387,14 @@ const parseMarketMakingConfig = (): MarketMakingConfig => ({
     priceRangeMax: parseFloat(process.env.MM_PRICE_RANGE_MAX || '0.90'),
     minMarketAgeDays: parseInt(process.env.MM_MIN_MARKET_AGE_DAYS || '14', 10),
     minDaysToResolution: parseInt(process.env.MM_MIN_DAYS_TO_RESOLUTION || '7', 10),
+    maxSigma: parseFloat(process.env.MM_MAX_SIGMA || '0.07'),
     postOnly: process.env.MM_POST_ONLY !== 'false',
     repriceThreshold: parseFloat(process.env.MM_REPRICE_THRESHOLD || '0.005'),
     orderSizeUSD: parseFloat(process.env.MM_ORDER_SIZE_USD || '100'),
     maxDailyLoss: parseFloat(process.env.MM_MAX_DAILY_LOSS || '200'),
     priceHistoryWindowHours: parseInt(process.env.MM_PRICE_HISTORY_WINDOW_HOURS || '168', 10),
     emMaxIterations: parseInt(process.env.MM_EM_MAX_ITERATIONS || '50', 10),
+    trendThreshold: parseFloat(process.env.MM_TREND_THRESHOLD || '0.3'),
 });
 
 export const ENV = {

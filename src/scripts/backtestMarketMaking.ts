@@ -40,7 +40,12 @@
 import axios from 'axios';
 import * as fs from 'fs';
 import * as path from 'path';
-import { estimateJumpDiffusion } from '../utils/jumpDiffusionModel';
+import {
+    estimateParamsHybrid,
+    classifyRegime,
+    detectTrend,
+    VolatilityRegime,
+} from '../utils/jumpDiffusionModel';
 import {
     computeQuotes,
     computeOrderSizes,
@@ -67,6 +72,7 @@ const CFG = {
     capitalPerMarket: parseFloat(process.env.MM_BACKTEST_CAPITAL || '1000'),
     rewardRatePerDay: parseFloat(process.env.MM_BACKTEST_REWARD_RATE || '2.0'), // $ per $1k deployed/day
     baseSpread: parseFloat(process.env.MM_BASE_SPREAD || '0.02'),
+    calmBaseSpread: parseFloat(process.env.MM_CALM_SPREAD || '0.01'),
     maxSpread: parseFloat(process.env.MM_MAX_SPREAD || '0.08'),
     riskAversion: parseFloat(process.env.MM_RISK_AVERSION || '0.2'),
     volSensitivity: parseFloat(process.env.MM_VOL_SENSITIVITY || '1.0'),
@@ -76,6 +82,9 @@ const CFG = {
     maxInventory: parseFloat(process.env.MM_MAX_INVENTORY_PER_MARKET || '500'),
     maxDailyLoss: parseFloat(process.env.MM_MAX_DAILY_LOSS || '200'),
     repriceThreshold: parseFloat(process.env.MM_REPRICE_THRESHOLD || '0.005'),
+    // Hard sigma cutoff — skip EXTREME markets entirely (backtest showed -190% ROI at σ=0.12)
+    maxSigma: parseFloat(process.env.MM_MAX_SIGMA || '0.07'),
+    trendThreshold: parseFloat(process.env.MM_TREND_THRESHOLD || '0.3'),
     emWindowHours: 24,       // hours of rolling history for EM
     emMinObs: 30,             // minimum observations before running EM
     emResampleMins: 60,      // re-run EM only every N ticks (1h) to avoid O(n²) cost
@@ -405,7 +414,8 @@ function simulateMarket(market: MarketInfo, ticks: PriceTick[]): MarketBacktestR
             const windowStart = Math.max(0, i - emWindowTicks);
             const wPrices = ticks.slice(windowStart, i + 1).map((t) => t.p);
             const wTs = ticks.slice(windowStart, i + 1).map((t) => t.t * 1000);
-            const est = estimateJumpDiffusion(wPrices, wTs, 15);  // 15 iterations
+            // Hybrid EM: σ from 1-min data, λ from hourly resampled data
+            const est = estimateParamsHybrid(wPrices, wTs);
             cachedSigma = est.sigma;
             cachedLambda = est.lambda;
             cachedFairValue = est.fairValue;
@@ -414,9 +424,24 @@ function simulateMarket(market: MarketInfo, ticks: PriceTick[]): MarketBacktestR
 
         const { sigma, lambda, fairValue } = { sigma: cachedSigma, lambda: cachedLambda, fairValue: cachedFairValue };
 
+        // ── Hard sigma cutoff (EXTREME regime gate) ──────────────────────────
+        const regime: VolatilityRegime = classifyRegime(sigma);
+        if (sigma >= CFG.maxSigma || regime === 'EXTREME') {
+            // Pause and skip — do not place quotes in high-vol markets
+            currentBid = -1;
+            currentAsk = -1;
+            continue;
+        }
+
         sigmaSum += sigma;
         lambdaSum += lambda;
         emCount++;
+
+        // ── Trend detection ──────────────────────────────────────────────────
+        const windowStart = Math.max(0, i - emWindowTicks);
+        const wPrices = ticks.slice(windowStart, i + 1).map((t) => t.p);
+        const wTs = ticks.slice(windowStart, i + 1).map((t) => t.t * 1000);
+        const trend = wPrices.length >= 4 ? detectTrend(wPrices, wTs, 6) : 0;
 
         // ── Compute quotes ───────────────────────────────────────────────────
         const daysToResolution =
@@ -428,17 +453,28 @@ function simulateMarket(market: MarketInfo, ticks: PriceTick[]): MarketBacktestR
             fairValue,
             sigma,
             lambda,
+            regime,
+            trend,
             netPosition: netPositionUSD,
             maxInventory: CFG.maxInventory,
             baseSpread: CFG.baseSpread,
+            calmBaseSpread: CFG.calmBaseSpread,
             maxSpread: CFG.maxSpread,
             riskAversion: CFG.riskAversion,
             volSensitivity: CFG.volSensitivity,
             jumpSensitivity: CFG.jumpSensitivity,
+            trendThreshold: CFG.trendThreshold,
             daysToResolution: Math.max(0, daysToResolution),
             totalMarketDuration: totalDuration,
             calendarFactor: CFG.calendarFactor,
         });
+
+        // Null return means EXTREME (should not happen after above gate, but guard)
+        if (!quotes) {
+            currentBid = -1;
+            currentAsk = -1;
+            continue;
+        }
 
         halfSpreadSum += quotes.halfSpread;
 
@@ -454,7 +490,11 @@ function simulateMarket(market: MarketInfo, ticks: PriceTick[]): MarketBacktestR
 
         // ── Simulate fills ───────────────────────────────────────────────────
         const { bidSize, askSize } = computeOrderSizes(
-            CFG.orderSizeUSD, quotes.normalizedInventory
+            CFG.orderSizeUSD,
+            quotes.normalizedInventory,
+            regime,
+            trend,
+            CFG.trendThreshold
         );
 
         // BUY fill: next price fell to/below our bid
@@ -625,7 +665,10 @@ function printFullReport(summary: BacktestSummary) {
     console.log(`  History window      : ${CFG.days} days`);
     console.log(`  Capital per market  : $${CFG.capitalPerMarket.toLocaleString()}`);
     console.log(`  Total capital       : $${summary.totalCapitalDeployed.toLocaleString()}`);
-    console.log(`  Base spread         : ${(CFG.baseSpread * 100).toFixed(1)}¢`);
+    console.log(`  Base spread (NORMAL): ${(CFG.baseSpread * 100).toFixed(1)}¢`);
+    console.log(`  Base spread (CALM)  : ${(CFG.calmBaseSpread * 100).toFixed(1)}¢`);
+    console.log(`  Max sigma cutoff    : ${CFG.maxSigma} (EXTREME regime excluded)`);
+    console.log(`  Trend threshold     : ${CFG.trendThreshold}`);
     console.log(`  Risk aversion γ     : ${CFG.riskAversion}`);
     console.log(`  Vol sensitivity β   : ${CFG.volSensitivity}`);
     console.log(`  Jump sensitivity ζ  : ${CFG.jumpSensitivity}`);
@@ -707,7 +750,8 @@ async function main() {
     console.log(C.cyan('\n🚀 MARKET MAKING STRATEGY BACKTESTER'));
     console.log(C.cyan('   arxiv 2510.15205 – Logit Jump-Diffusion Model\n'));
     console.log(C.gray(`   Markets: ${CFG.markets} | History: ${CFG.days} days | Capital: $${CFG.capitalPerMarket}/market`));
-    console.log(C.gray(`   Spread: ${CFG.baseSpread} | γ=${CFG.riskAversion} β=${CFG.volSensitivity} ζ=${CFG.jumpSensitivity}\n`));
+    console.log(C.gray(`   Spread: ${CFG.baseSpread} (calm: ${CFG.calmBaseSpread}) | γ=${CFG.riskAversion} β=${CFG.volSensitivity} ζ=${CFG.jumpSensitivity}`));
+    console.log(C.gray(`   maxSigma: ${CFG.maxSigma} | trendThreshold: ${CFG.trendThreshold} | hybrid EM: σ(1min)+λ(hourly)\n`));
 
     // 1. Load market data (live or synthetic)
     const results: MarketBacktestResult[] = [];

@@ -11,7 +11,34 @@
  *
  * We use an EM (Expectation-Maximization) algorithm to separate the two components
  * and estimate σ (belief volatility) and λ (jump intensity) from price history.
+ *
+ * Volatility regime classification:
+ *   CALM    σ < 0.02  — stable, tight spreads, ideal for MM
+ *   NORMAL  σ < 0.06  — standard operation
+ *   VOLATILE σ < 0.10 — wide spreads, reduced size
+ *   EXTREME σ ≥ 0.10  — skip market entirely
  */
+
+// ── Volatility regime ─────────────────────────────────────────────────────────
+
+/**
+ * Volatility regime based on diffusion σ (log-odds space, per √day).
+ * Used to gate market selection and scale order sizes.
+ */
+export type VolatilityRegime = 'CALM' | 'NORMAL' | 'VOLATILE' | 'EXTREME';
+
+/**
+ * Classify the volatility regime from a σ estimate.
+ * Thresholds are calibrated against the backtest: EXTREME (≥0.10) produced
+ * catastrophic losses (-190% ROI) in 14-day backtests; CALM (<0.02) produced
+ * the best risk-adjusted returns.
+ */
+export function classifyRegime(sigma: number): VolatilityRegime {
+    if (sigma < 0.02) return 'CALM';
+    if (sigma < 0.06) return 'NORMAL';
+    if (sigma < 0.10) return 'VOLATILE';
+    return 'EXTREME';
+}
 
 // ── Helper math ───────────────────────────────────────────────────────────────
 
@@ -252,4 +279,118 @@ export function detectRecentJump(recentPrices: number[], thresholdLogOdds = 0.4)
     const last = logit(recentPrices[n - 1]);
     const prev = logit(recentPrices[n - 2]);
     return Math.abs(last - prev) > thresholdLogOdds;
+}
+
+// ── Regime-aware hybrid estimation ────────────────────────────────────────────
+
+/**
+ * Downsample a (prices, timestamps) series to one representative point per
+ * `targetMs` millisecond bucket (last-price-in-bucket).
+ *
+ * Motivation: EM on 1-minute data inflates λ to 400-600/day because
+ * microstructure noise is classified as "jumps".  Downsampling to hourly
+ * gives realistic λ ≈ 0.1-2.0/day while 1-min data is still used for σ.
+ */
+export function resamplePrices(
+    prices: number[],
+    timestamps: number[],
+    targetMs: number
+): { prices: number[]; timestamps: number[] } {
+    if (prices.length === 0) return { prices: [], timestamps: [] };
+
+    const buckets = new Map<number, { price: number; ts: number }>();
+    for (let i = 0; i < prices.length; i++) {
+        const bucket = Math.floor(timestamps[i] / targetMs);
+        // Keep last price in each bucket
+        buckets.set(bucket, { price: prices[i], ts: timestamps[i] });
+    }
+
+    const sorted = Array.from(buckets.entries()).sort((a, b) => a[0] - b[0]);
+    return {
+        prices: sorted.map((e) => e[1].price),
+        timestamps: sorted.map((e) => e[1].ts),
+    };
+}
+
+/**
+ * Hybrid parameter estimation:
+ *   - σ (diffusion volatility) estimated from high-frequency (1-min) data
+ *     → captures continuous belief evolution accurately
+ *   - λ (jump intensity) estimated from hourly-resampled data
+ *     → avoids microstructure noise inflating jump counts
+ *
+ * Returns the same JumpDiffusionParams interface, combining the two estimates.
+ */
+export function estimateParamsHybrid(
+    prices1min: number[],
+    timestamps1min: number[]
+): JumpDiffusionParams {
+    // σ from 1-minute data (standard EM)
+    const hiFreq = estimateJumpDiffusion(prices1min, timestamps1min, 30, 1e-4);
+
+    // λ from hourly resampled data
+    const hourMs = 3_600_000;
+    const { prices: pricesH, timestamps: tsH } = resamplePrices(prices1min, timestamps1min, hourMs);
+    const loFreq = pricesH.length >= 5
+        ? estimateJumpDiffusion(pricesH, tsH, 30, 1e-4)
+        : hiFreq;
+
+    return {
+        ...hiFreq,
+        // Override λ with the hourly estimate (unit: jumps/day)
+        lambda: loFreq.lambda,
+    };
+}
+
+/**
+ * Detect directional trend via linear regression on logit prices.
+ *
+ * Returns a normalised slope in [-1, +1]:
+ *   > +trendThreshold → uptrend (bullish)
+ *   < -trendThreshold → downtrend (bearish)
+ *   near 0            → no significant trend
+ *
+ * @param prices      Price series [0,1]
+ * @param timestamps  Corresponding timestamps (ms)
+ * @param windowHours How many hours of history to analyse (default 6)
+ * @returns slope in log-odds-per-day, normalised by the logit std of the window
+ */
+export function detectTrend(
+    prices: number[],
+    timestamps: number[],
+    windowHours = 6
+): number {
+    if (prices.length < 4) return 0;
+
+    const now = timestamps[timestamps.length - 1] ?? Date.now();
+    const cutoff = now - windowHours * 3_600_000;
+    const idx = timestamps.findIndex((t) => t >= cutoff);
+    const slice = idx >= 0 ? prices.slice(idx) : prices;
+    const tsSlice = idx >= 0 ? timestamps.slice(idx) : timestamps;
+
+    if (slice.length < 4) return 0;
+
+    // Work in logit + time (days)
+    const t0 = tsSlice[0];
+    const xs = tsSlice.map((t) => (t - t0) / (1000 * 60 * 60 * 24));
+    const ys = slice.map(logit);
+
+    // Simple OLS slope: β = Σ(xi - x̄)(yi - ȳ) / Σ(xi - x̄)²
+    const xMean = mean(xs);
+    const yMean = mean(ys);
+    let num = 0;
+    let den = 0;
+    for (let i = 0; i < xs.length; i++) {
+        num += (xs[i] - xMean) * (ys[i] - yMean);
+        den += (xs[i] - xMean) ** 2;
+    }
+    if (den < 1e-10) return 0;
+    const slope = num / den; // log-odds per day
+
+    // Normalise by std of y so result is ~unit-free
+    const yStd = Math.max(std(ys), 0.01);
+    const normalised = slope / yStd;
+
+    // Clamp to [-1, +1]
+    return Math.max(-1, Math.min(1, normalised));
 }

@@ -12,7 +12,11 @@
 import { ENV } from '../config/env';
 import fetchData from '../utils/fetchData';
 import Logger from '../utils/logger';
-import { estimateJumpDiffusion } from '../utils/jumpDiffusionModel';
+import {
+    estimateParamsHybrid,
+    classifyRegime,
+    detectTrend,
+} from '../utils/jumpDiffusionModel';
 import { riskAdjustedScore, estimateDailyReward } from '../utils/marketMakingPricer';
 import {
     MMPriceHistoryModel,
@@ -221,19 +225,40 @@ async function scoreAndSaveMarket(market: PolymarketMarket): Promise<number> {
     // Filter check
     if (!passesFilter(market, currentPrice)) return 0;
 
-    // EM parameter estimation
-    const { sigma, lambda, fairValue } = prices.length >= 5
-        ? estimateJumpDiffusion(prices, timestamps, MM_CFG.emMaxIterations)
+    // EM parameter estimation (hybrid: σ from 1-min, λ from hourly resampled)
+    const emResult = prices.length >= 5
+        ? estimateParamsHybrid(prices, timestamps)
         : { sigma: 0.05, lambda: 0.1, fairValue: currentPrice };
+    const { sigma, lambda, fairValue } = emResult;
 
-    // Reward estimation
+    // Classify regime and apply hard σ cutoff
+    const regime = classifyRegime(sigma);
+    if (sigma >= MM_CFG.maxSigma) {
+        // Mark as inactive (too volatile for market making)
+        await MMMarketModel.updateOne(
+            { conditionId: market.condition_id },
+            { $set: { active: false, sigma, lambda, regime, lastScored: new Date() } },
+            { upsert: false }
+        ).catch(() => {});
+        return 0;
+    }
+
+    // Trend detection (6-hour window in logit space)
+    const trend = prices.length >= 4
+        ? detectTrend(prices, timestamps, 6)
+        : 0;
+
+    // Reward estimation (use regime-appropriate base spread for halfSpread)
     const rewardPool = extractRewardPool(market);
     const totalLiquidity = market.liquidity ?? 1000;
     const deployedCapital = Math.min(MM_CFG.orderSizeUSD, MM_CFG.maxInventoryPerMarket);
-    const halfSpread = MM_CFG.baseSpread / 2;
+    const regimeBaseSpread = regime === 'CALM' ? MM_CFG.calmBaseSpread
+        : regime === 'VOLATILE' ? MM_CFG.baseSpread * 1.5
+        : MM_CFG.baseSpread;
+    const halfSpread = regimeBaseSpread / 2;
     const dailyReward = estimateDailyReward(deployedCapital, halfSpread, rewardPool, totalLiquidity);
 
-    const score = riskAdjustedScore(dailyReward, sigma, lambda);
+    const score = riskAdjustedScore(dailyReward, sigma, lambda, regime);
 
     const endDate = market.end_date_iso || market.end_date;
     const startDate = market.start_date_iso;
@@ -255,6 +280,8 @@ async function scoreAndSaveMarket(market: PolymarketMarket): Promise<number> {
                 score,
                 sigma,
                 lambda,
+                regime,
+                trend,
                 active: true,
                 lastScored: new Date(),
             } as Partial<IMMMarket>,
