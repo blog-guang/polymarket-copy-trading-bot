@@ -370,32 +370,61 @@ export interface MarketMakingConfig {
     trendThreshold: number;
 }
 
-const parseMarketMakingConfig = (): MarketMakingConfig => ({
-    baseSpread: parseFloat(process.env.MM_BASE_SPREAD || '0.02'),
-    calmBaseSpread: parseFloat(process.env.MM_CALM_SPREAD || '0.01'),
-    maxSpread: parseFloat(process.env.MM_MAX_SPREAD || '0.08'),
-    baseCapital: parseFloat(process.env.MM_BASE_CAPITAL || '10000'),
-    maxInventoryPerMarket: parseFloat(process.env.MM_MAX_INVENTORY_PER_MARKET || '500'),
-    maxTotalInventory: parseFloat(process.env.MM_MAX_TOTAL_INVENTORY || '3000'),
-    marketLimit: parseInt(process.env.MM_MARKET_LIMIT || '20', 10),
-    rebalanceIntervalSec: parseInt(process.env.MM_REBALANCE_INTERVAL || '30', 10),
-    riskAversion: parseFloat(process.env.MM_RISK_AVERSION || '0.2'),
-    volSensitivity: parseFloat(process.env.MM_VOL_SENSITIVITY || '1.0'),
-    jumpSensitivity: parseFloat(process.env.MM_JUMP_SENSITIVITY || '0.5'),
-    calendarFactor: parseFloat(process.env.MM_CALENDAR_FACTOR || '2.0'),
-    priceRangeMin: parseFloat(process.env.MM_PRICE_RANGE_MIN || '0.10'),
-    priceRangeMax: parseFloat(process.env.MM_PRICE_RANGE_MAX || '0.90'),
-    minMarketAgeDays: parseInt(process.env.MM_MIN_MARKET_AGE_DAYS || '14', 10),
-    minDaysToResolution: parseInt(process.env.MM_MIN_DAYS_TO_RESOLUTION || '7', 10),
-    maxSigma: parseFloat(process.env.MM_MAX_SIGMA || '0.07'),
-    postOnly: process.env.MM_POST_ONLY !== 'false',
-    repriceThreshold: parseFloat(process.env.MM_REPRICE_THRESHOLD || '0.005'),
-    orderSizeUSD: parseFloat(process.env.MM_ORDER_SIZE_USD || '100'),
-    maxDailyLoss: parseFloat(process.env.MM_MAX_DAILY_LOSS || '200'),
-    priceHistoryWindowHours: parseInt(process.env.MM_PRICE_HISTORY_WINDOW_HOURS || '168', 10),
-    emMaxIterations: parseInt(process.env.MM_EM_MAX_ITERATIONS || '50', 10),
-    trendThreshold: parseFloat(process.env.MM_TREND_THRESHOLD || '0.3'),
-});
+const parseMarketMakingConfig = (): MarketMakingConfig => {
+    const cfg: MarketMakingConfig = {
+        baseSpread: parseFloat(process.env.MM_BASE_SPREAD || '0.02'),
+        calmBaseSpread: parseFloat(process.env.MM_CALM_SPREAD || '0.01'),
+        maxSpread: parseFloat(process.env.MM_MAX_SPREAD || '0.08'),
+        baseCapital: parseFloat(process.env.MM_BASE_CAPITAL || '10000'),
+        maxInventoryPerMarket: parseFloat(process.env.MM_MAX_INVENTORY_PER_MARKET || '500'),
+        maxTotalInventory: parseFloat(process.env.MM_MAX_TOTAL_INVENTORY || '3000'),
+        marketLimit: parseInt(process.env.MM_MARKET_LIMIT || '20', 10),
+        rebalanceIntervalSec: parseInt(process.env.MM_REBALANCE_INTERVAL || '30', 10),
+        riskAversion: parseFloat(process.env.MM_RISK_AVERSION || '0.2'),
+        volSensitivity: parseFloat(process.env.MM_VOL_SENSITIVITY || '1.0'),
+        jumpSensitivity: parseFloat(process.env.MM_JUMP_SENSITIVITY || '0.5'),
+        calendarFactor: parseFloat(process.env.MM_CALENDAR_FACTOR || '2.0'),
+        priceRangeMin: parseFloat(process.env.MM_PRICE_RANGE_MIN || '0.10'),
+        priceRangeMax: parseFloat(process.env.MM_PRICE_RANGE_MAX || '0.90'),
+        minMarketAgeDays: parseInt(process.env.MM_MIN_MARKET_AGE_DAYS || '14', 10),
+        minDaysToResolution: parseInt(process.env.MM_MIN_DAYS_TO_RESOLUTION || '7', 10),
+        maxSigma: parseFloat(process.env.MM_MAX_SIGMA || '0.07'),
+        postOnly: process.env.MM_POST_ONLY !== 'false',
+        repriceThreshold: parseFloat(process.env.MM_REPRICE_THRESHOLD || '0.005'),
+        orderSizeUSD: parseFloat(process.env.MM_ORDER_SIZE_USD || '100'),
+        maxDailyLoss: parseFloat(process.env.MM_MAX_DAILY_LOSS || '200'),
+        priceHistoryWindowHours: parseInt(process.env.MM_PRICE_HISTORY_WINDOW_HOURS || '168', 10),
+        emMaxIterations: parseInt(process.env.MM_EM_MAX_ITERATIONS || '50', 10),
+        trendThreshold: parseFloat(process.env.MM_TREND_THRESHOLD || '0.3'),
+    };
+
+    // Validate only when actually running market-making mode
+    const mode = (process.env.BOT_MODE || 'COPY').toUpperCase();
+    if (mode === 'MARKET_MAKING' || mode === 'HYBRID') {
+        if (cfg.calmBaseSpread <= 0 || cfg.baseSpread <= 0 || cfg.maxSpread <= 0)
+            throw new Error('MM spreads must be > 0');
+        if (cfg.calmBaseSpread >= cfg.baseSpread)
+            throw new Error('MM_CALM_SPREAD must be < MM_BASE_SPREAD');
+        if (cfg.baseSpread >= cfg.maxSpread)
+            throw new Error('MM_BASE_SPREAD must be < MM_MAX_SPREAD');
+        if (cfg.maxSpread > 0.5)
+            throw new Error('MM_MAX_SPREAD must be ≤ 0.5 (50 cents)');
+        if (cfg.orderSizeUSD < 1)
+            throw new Error('MM_ORDER_SIZE_USD must be ≥ $1 (Polymarket minimum)');
+        if (cfg.priceRangeMin >= cfg.priceRangeMax)
+            throw new Error('MM_PRICE_RANGE_MIN must be < MM_PRICE_RANGE_MAX');
+        if (cfg.priceRangeMin < 0.01 || cfg.priceRangeMax > 0.99)
+            throw new Error('MM price range must be within [0.01, 0.99]');
+        if (cfg.maxInventoryPerMarket > cfg.maxTotalInventory)
+            throw new Error('MM_MAX_INVENTORY_PER_MARKET must be ≤ MM_MAX_TOTAL_INVENTORY');
+        if (cfg.rebalanceIntervalSec < 5)
+            throw new Error('MM_REBALANCE_INTERVAL must be ≥ 5 seconds');
+        if (cfg.maxSigma <= 0 || cfg.maxSigma > 1)
+            throw new Error('MM_MAX_SIGMA must be in (0, 1]');
+    }
+
+    return cfg;
+};
 
 export const ENV = {
     USER_ADDRESSES: parseUserAddresses(process.env.USER_ADDRESSES as string),

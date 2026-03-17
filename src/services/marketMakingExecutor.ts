@@ -231,7 +231,37 @@ async function cancelMarketOrders(
     conditionId: string
 ): Promise<void> {
     try {
+        // Capture partial fill state BEFORE cancelling so we account for
+        // any size_matched on live orders that will disappear after cancel.
+        const liveOrders = await getOpenOrdersForMarket(clobClient, conditionId);
+        const partialMap = new Map<string, number>(); // orderId → tokens matched
+        for (const o of liveOrders) {
+            const matched = parseFloat(o.size_matched ?? '0');
+            if (matched > 0) partialMap.set(o.id, matched);
+        }
+
         await (clobClient as any).cancelMarketOrders(conditionId);
+
+        // Record partial fills for any orders that had tokens matched
+        if (partialMap.size > 0) {
+            const dbOrders = await MMOpenOrderModel.find({
+                orderId: { $in: [...partialMap.keys()] },
+                status: 'OPEN',
+            }).lean();
+            await Promise.allSettled(
+                dbOrders.map(async (dbOrd) => {
+                    const matched = partialMap.get(dbOrd.orderId)!;
+                    const fillUSD = matched * dbOrd.price;
+                    await recordFill(dbOrd.conditionId, dbOrd.side as 'BUY' | 'SELL', dbOrd.price, fillUSD);
+                    await MMOpenOrderModel.updateOne(
+                        { orderId: dbOrd.orderId },
+                        { $set: { status: 'PARTIALLY_FILLED', updatedAt: new Date() } }
+                    );
+                })
+            );
+        }
+
+        // Mark remaining OPEN orders as CANCELLED
         await MMOpenOrderModel.updateMany(
             { conditionId, status: 'OPEN' },
             { $set: { status: 'CANCELLED', updatedAt: new Date() } }
@@ -303,6 +333,21 @@ async function updateQuotesForMarket(
 
     const { mid: currentPrice } = book;
 
+    // Market resolution guard: price collapsing to 0 or 1 signals imminent settlement.
+    // Cancel all orders and deactivate the market rather than quoting into a resolved event.
+    const RESOLUTION_THRESHOLD = 0.02;
+    if (currentPrice <= RESOLUTION_THRESHOLD || currentPrice >= 1 - RESOLUTION_THRESHOLD) {
+        Logger.info(
+            `[MM Executor] Market near resolution (price=${currentPrice.toFixed(3)}): ${market.question?.slice(0, 40)} — cancelling and deactivating`
+        );
+        await cancelMarketOrders(clobClient, market.conditionId);
+        await MMMarketModel.updateOne(
+            { conditionId: market.conditionId },
+            { $set: { active: false } }
+        );
+        return;
+    }
+
     // 2. Load price history & run hybrid EM (σ from 1-min, λ from hourly)
     const { prices, timestamps } = await loadRecentPrices(market.conditionId);
 
@@ -334,6 +379,16 @@ async function updateQuotesForMarket(
 
     // 3. Get inventory
     const inv = await getInventory(market.conditionId, market.tokenIdYes);
+
+    // Update unrealized P&L every cycle: netPosition × currentPrice − costBasis
+    if (inv.netPosition !== 0) {
+        const unrealizedPnl = inv.netPosition * currentPrice - inv.costBasis;
+        await MMInventoryModel.updateOne(
+            { conditionId: market.conditionId },
+            { $set: { unrealizedPnl, lastUpdated: new Date() } }
+        );
+        (inv as any).unrealizedPnl = unrealizedPnl; // keep in-memory value consistent
+    }
 
     // 4. Circuit breaker
     const prevPrice = prices.length > 0 ? prices[prices.length - 1] : currentPrice;
@@ -397,7 +452,41 @@ async function updateQuotesForMarket(
         MM_CFG.trendThreshold
     );
 
-    const bidId = await placeGTCOrder(clobClient, market, 'BUY', quotes.bid, bidSize);
+    // ── Quote sanity guard ────────────────────────────────────────────────────
+    if (quotes.bid >= quotes.ask) {
+        Logger.warning(
+            `[MM Executor] Spread collapsed (bid=${quotes.bid.toFixed(3)} >= ask=${quotes.ask.toFixed(3)}) on ${market.question?.slice(0, 30)}, skipping`
+        );
+        return;
+    }
+    if (quotes.bid < 0.01 || quotes.ask > 0.99) {
+        Logger.warning(
+            `[MM Executor] Quote out of valid range (bid=${quotes.bid.toFixed(3)}, ask=${quotes.ask.toFixed(3)}), skipping`
+        );
+        return;
+    }
+    if (bidSize < 1 || askSize < 1) {
+        Logger.warning(`[MM Executor] Order size below $1 minimum on ${market.question?.slice(0, 30)}, skipping`);
+        return;
+    }
+
+    // ── Total inventory ceiling ───────────────────────────────────────────────
+    // Suppress new BUY orders when aggregate exposure across all markets hits the cap
+    const allInv = await MMInventoryModel.find({}, { netPosition: 1, avgEntryPrice: 1 }).lean();
+    const totalInventoryUSD = allInv.reduce(
+        (sum, i) => sum + Math.abs(i.netPosition * i.avgEntryPrice),
+        0
+    );
+    const atInventoryCeiling = totalInventoryUSD >= MM_CFG.maxTotalInventory;
+    if (atInventoryCeiling) {
+        Logger.warning(
+            `[MM Executor] Total inventory $${totalInventoryUSD.toFixed(0)} >= limit $${MM_CFG.maxTotalInventory} — bids suppressed for ${market.question?.slice(0, 30)}`
+        );
+    }
+
+    const bidId = atInventoryCeiling
+        ? null
+        : await placeGTCOrder(clobClient, market, 'BUY', quotes.bid, bidSize);
     const askId = await placeGTCOrder(clobClient, market, 'SELL', quotes.ask, askSize);
 
     Logger.info(
@@ -481,9 +570,47 @@ async function executorTick(clobClient: ClobClient): Promise<void> {
 
 // ── Service entry point ───────────────────────────────────────────────────────
 
+/**
+ * Cold-start cleanup: cancel every order that's recorded as OPEN in our DB
+ * on CLOB.  This prevents stale quotes from previous sessions interfering with
+ * fresh inventory accounting.  Called once before the first tick.
+ */
+async function cancelAllStaleOrders(clobClient: ClobClient): Promise<void> {
+    const staleOrders = await MMOpenOrderModel.find({ status: 'OPEN' }).lean();
+    if (staleOrders.length === 0) return;
+
+    const staleByMarket = new Map<string, typeof staleOrders>();
+    for (const o of staleOrders) {
+        const list = staleByMarket.get(o.conditionId) ?? [];
+        list.push(o);
+        staleByMarket.set(o.conditionId, list);
+    }
+
+    let cancelled = 0;
+    for (const [conditionId] of staleByMarket) {
+        try {
+            await (clobClient as any).cancelMarketOrders(conditionId);
+            cancelled++;
+        } catch (err) {
+            Logger.warning(`[MM Executor] Could not cancel stale orders for ${conditionId.slice(0, 8)}: ${err}`);
+        }
+    }
+
+    // Mark all as CANCELLED regardless — on restart we start fresh
+    await MMOpenOrderModel.updateMany(
+        { status: 'OPEN' },
+        { $set: { status: 'CANCELLED', updatedAt: new Date() } }
+    );
+
+    Logger.info(`[MM Executor] Startup: cancelled stale orders across ${cancelled}/${staleByMarket.size} markets`);
+}
+
 export default async function marketMakingExecutor(clobClient: ClobClient): Promise<void> {
     running = true;
     Logger.info('[MM Executor] Service started');
+
+    // Cancel any orders left open from a previous session before placing new quotes
+    await cancelAllStaleOrders(clobClient);
 
     const tick = async () => {
         if (!running) return;

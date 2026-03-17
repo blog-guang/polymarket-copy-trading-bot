@@ -19,9 +19,10 @@ const MMPriceHistorySchema = new Schema<IMMPriceHistory>(
     { collection: 'mm_price_history' }
 );
 
-// Compound index for efficient time-range queries per market
-MMPriceHistorySchema.index({ conditionId: 1, timestamp: -1 });
-MMPriceHistorySchema.index({ tokenId: 1, timestamp: -1 });
+// Unique index prevents duplicate ticks for the same (market, token, time) triple
+MMPriceHistorySchema.index({ conditionId: 1, tokenId: 1, timestamp: 1 }, { unique: true });
+// Sparse timestamp index for global pruning query
+MMPriceHistorySchema.index({ timestamp: -1 });
 
 export const MMPriceHistoryModel = mongoose.model<IMMPriceHistory>(
     'MMPriceHistory',
