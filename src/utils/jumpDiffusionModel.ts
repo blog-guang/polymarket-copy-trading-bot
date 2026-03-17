@@ -28,15 +28,21 @@
 export type VolatilityRegime = 'CALM' | 'NORMAL' | 'VOLATILE' | 'EXTREME';
 
 /**
- * Classify the volatility regime from a σ estimate.
- * Thresholds are calibrated against the backtest: EXTREME (≥0.10) produced
- * catastrophic losses (-190% ROI) in 14-day backtests; CALM (<0.02) produced
- * the best risk-adjusted returns.
+ * Classify the volatility regime from a total-volatility estimate.
+ *
+ * Input should be `sigmaTotal = sqrt(σ_D² + λ × σ_J²)` — the combined
+ * diffusion+jump risk measure.  Using sigmaTotal (rather than raw σ_D) is
+ * critical for jump-dominated markets (e.g. binary prediction markets where
+ * σ_D ≈ 0 but jumps are substantial).
+ *
+ * Thresholds are calibrated against backtests:
+ *   EXTREME (≥0.10) → catastrophic losses (-190% ROI in 14-day backtests)
+ *   CALM    (<0.02) → best risk-adjusted returns (tight spreads capture rewards)
  */
-export function classifyRegime(sigma: number): VolatilityRegime {
-    if (sigma < 0.02) return 'CALM';
-    if (sigma < 0.06) return 'NORMAL';
-    if (sigma < 0.10) return 'VOLATILE';
+export function classifyRegime(sigmaTotal: number): VolatilityRegime {
+    if (sigmaTotal < 0.02) return 'CALM';
+    if (sigmaTotal < 0.06) return 'NORMAL';
+    if (sigmaTotal < 0.10) return 'VOLATILE';
     return 'EXTREME';
 }
 
@@ -95,6 +101,15 @@ export interface JumpDiffusionParams {
     muJump: number;
     /** Jump size standard deviation in log-odds */
     sigmaJump: number;
+    /**
+     * Total effective volatility combining diffusion and jump components:
+     *   σ_total = sqrt(σ² + λ × σ_J²)
+     *
+     * This is the correct measure for spread sizing in jump-dominated markets
+     * (typical of Polymarket binary markets where diffusion σ ≈ 0 between trades).
+     * Use this for regime classification and spread gating.
+     */
+    sigmaTotal: number;
     /** Estimated fair value (probability 0–1) */
     fairValue: number;
     /** Number of price observations used */
@@ -122,6 +137,7 @@ export function estimateJumpDiffusion(
         lambda: 0.1,
         muJump: 0,
         sigmaJump: 0.2,
+        sigmaTotal: Math.sqrt(0.05 ** 2 + 0.1 * 0.2 ** 2),
         fairValue: prices.length > 0 ? prices[prices.length - 1] : 0.5,
         nObs: prices.length,
         converged: false,
@@ -216,11 +232,18 @@ export function estimateJumpDiffusion(
     // ── Fair value: EMA of logit prices, mapped back to probability ───────────
     const fairValue = logistic(ema(logOdds, 0.3));
 
+    const sigmaD_final = Math.max(0.001, sigmaD);
+    const lambda_final = Math.max(0.001, lambda);
+    // Total effective volatility: σ_total = sqrt(σ_D² + λ × σ_J²)
+    // This correctly captures jump-dominated markets where σ_D ≈ 0 but jumps are large.
+    const sigmaTotal = Math.sqrt(sigmaD_final ** 2 + lambda_final * sigmaJ ** 2);
+
     return {
-        sigma: Math.max(0.001, sigmaD),
-        lambda: Math.max(0.001, lambda),
+        sigma: sigmaD_final,
+        lambda: lambda_final,
         muJump: muJ,
         sigmaJump: sigmaJ,
+        sigmaTotal,
         fairValue,
         nObs: prices.length,
         converged,
@@ -335,10 +358,14 @@ export function estimateParamsHybrid(
         ? estimateJumpDiffusion(pricesH, tsH, 30, 1e-4)
         : hiFreq;
 
+    const lambda_combined = loFreq.lambda;
+    // Recompute sigmaTotal using the hourly (more realistic) λ
+    const sigmaTotal = Math.sqrt(hiFreq.sigma ** 2 + lambda_combined * hiFreq.sigmaJump ** 2);
     return {
         ...hiFreq,
         // Override λ with the hourly estimate (unit: jumps/day)
-        lambda: loFreq.lambda,
+        lambda: lambda_combined,
+        sigmaTotal,
     };
 }
 

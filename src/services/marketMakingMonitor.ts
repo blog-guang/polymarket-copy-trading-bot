@@ -228,12 +228,12 @@ async function scoreAndSaveMarket(market: PolymarketMarket): Promise<number> {
     // EM parameter estimation (hybrid: σ from 1-min, λ from hourly resampled)
     const emResult = prices.length >= 5
         ? estimateParamsHybrid(prices, timestamps)
-        : { sigma: 0.05, lambda: 0.1, fairValue: currentPrice };
-    const { sigma, lambda, fairValue } = emResult;
+        : { sigma: 0.05, lambda: 0.1, sigmaTotal: 0.05, fairValue: currentPrice, muJump: 0, sigmaJump: 0.03, nObs: prices.length, converged: false };
+    const { sigma, lambda, sigmaTotal, fairValue } = emResult;
 
-    // Classify regime and apply hard σ cutoff
-    const regime = classifyRegime(sigma);
-    if (sigma >= MM_CFG.maxSigma) {
+    // Classify regime using sigmaTotal (includes jump risk, not just diffusion)
+    const regime = classifyRegime(sigmaTotal);
+    if (sigmaTotal >= MM_CFG.maxSigma) {
         // Mark as inactive (too volatile for market making)
         await MMMarketModel.updateOne(
             { conditionId: market.condition_id },

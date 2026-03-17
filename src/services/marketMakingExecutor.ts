@@ -305,15 +305,16 @@ async function updateQuotesForMarket(
     const allPrices = [...prices, currentPrice];
     const allTs = [...timestamps, Date.now()];
 
-    const { sigma, lambda, fairValue } = allPrices.length >= 5
+    const emResult = allPrices.length >= 5
         ? estimateParamsHybrid(allPrices, allTs)
-        : { sigma: 0.05, lambda: 0.1, fairValue: currentPrice };
+        : { sigma: 0.05, lambda: 0.1, sigmaTotal: 0.05, fairValue: currentPrice, muJump: 0, sigmaJump: 0.03, nObs: allPrices.length, converged: false };
+    const { sigma, lambda, sigmaTotal, fairValue } = emResult;
 
-    // Classify regime and apply hard σ cutoff
-    const regime: VolatilityRegime = classifyRegime(sigma);
-    if (regime === 'EXTREME' || sigma >= MM_CFG.maxSigma) {
+    // Classify regime and apply hard σ cutoff (using sigmaTotal: includes jump risk)
+    const regime: VolatilityRegime = classifyRegime(sigmaTotal);
+    if (regime === 'EXTREME' || sigmaTotal >= MM_CFG.maxSigma) {
         Logger.warning(
-            `[MM Executor] Skipping ${market.question?.slice(0, 40)} — σ=${sigma.toFixed(3)} (EXTREME)`
+            `[MM Executor] Skipping ${market.question?.slice(0, 40)} — σ_total=${sigmaTotal.toFixed(3)} (EXTREME)`
         );
         await cancelMarketOrders(clobClient, market.conditionId);
         return;

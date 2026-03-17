@@ -69,6 +69,8 @@ const CFG = {
     markets: parseInt(process.env.MM_BACKTEST_MARKETS || '10', 10),
     days: parseInt(process.env.MM_BACKTEST_DAYS || '30', 10),
     offline: process.env.MM_BACKTEST_OFFLINE !== 'false', // default: true (safe for CI/sandbox)
+    /** Path to pre-fetched market data JSON (bypasses both synthetic and live API) */
+    dataFile: process.env.MM_BACKTEST_DATA_FILE || '',
     capitalPerMarket: parseFloat(process.env.MM_BACKTEST_CAPITAL || '1000'),
     rewardRatePerDay: parseFloat(process.env.MM_BACKTEST_REWARD_RATE || '2.0'), // $ per $1k deployed/day
     baseSpread: parseFloat(process.env.MM_BASE_SPREAD || '0.02'),
@@ -374,6 +376,7 @@ function simulateMarket(market: MarketInfo, ticks: PriceTick[]): MarketBacktestR
     let cachedSigma = 0.05;
     let cachedLambda = 0.1;
     let cachedFairValue = ticks[0]?.p ?? 0.5;
+    let cachedSigmaTotal = 0.05;
     let lastEmTick = -1;
 
     for (let i = CFG.emMinObs; i < ticks.length - 1; i++) {
@@ -419,21 +422,25 @@ function simulateMarket(market: MarketInfo, ticks: PriceTick[]): MarketBacktestR
             cachedSigma = est.sigma;
             cachedLambda = est.lambda;
             cachedFairValue = est.fairValue;
+            cachedSigmaTotal = est.sigmaTotal;
             lastEmTick = i;
         }
 
-        const { sigma, lambda, fairValue } = { sigma: cachedSigma, lambda: cachedLambda, fairValue: cachedFairValue };
+        const sigma = cachedSigma;
+        const lambda = cachedLambda;
+        const fairValue = cachedFairValue;
+        const sigmaTotal = cachedSigmaTotal;
 
-        // ── Hard sigma cutoff (EXTREME regime gate) ──────────────────────────
-        const regime: VolatilityRegime = classifyRegime(sigma);
-        if (sigma >= CFG.maxSigma || regime === 'EXTREME') {
+        // ── Hard sigma cutoff using sigmaTotal (diffusion + jump risk) ───────
+        const regime: VolatilityRegime = classifyRegime(sigmaTotal);
+        if (sigmaTotal >= CFG.maxSigma || regime === 'EXTREME') {
             // Pause and skip — do not place quotes in high-vol markets
             currentBid = -1;
             currentAsk = -1;
             continue;
         }
 
-        sigmaSum += sigma;
+        sigmaSum += sigmaTotal;  // use sigmaTotal for stats (more meaningful)
         lambdaSum += lambda;
         emCount++;
 
@@ -738,7 +745,8 @@ function saveResults(summary: BacktestSummary) {
     const dir = path.join(process.cwd(), 'simulation_results');
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 
-    const filename = `mm_backtest_${CFG.days}d_${CFG.markets}markets_${new Date().toISOString().slice(0, 10)}.json`;
+    const mode = CFG.dataFile ? 'realdata' : (CFG.offline ? 'synthetic' : 'live');
+    const filename = `mm_backtest_${mode}_${CFG.days}d_${CFG.markets}markets_${new Date().toISOString().slice(0, 10)}.json`;
     const filepath = path.join(dir, filename);
     fs.writeFileSync(filepath, JSON.stringify(summary, null, 2), 'utf8');
     console.log(C.green(`\n✓ Results saved to: ${filepath}\n`));
@@ -753,11 +761,60 @@ async function main() {
     console.log(C.gray(`   Spread: ${CFG.baseSpread} (calm: ${CFG.calmBaseSpread}) | γ=${CFG.riskAversion} β=${CFG.volSensitivity} ζ=${CFG.jumpSensitivity}`));
     console.log(C.gray(`   maxSigma: ${CFG.maxSigma} | trendThreshold: ${CFG.trendThreshold} | hybrid EM: σ(1min)+λ(hourly)\n`));
 
-    // 1. Load market data (live or synthetic)
+    // 1. Load market data (real pre-fetched / synthetic / live)
     const results: MarketBacktestResult[] = [];
     const useOffline = CFG.offline;
 
-    if (useOffline) {
+    // ── Real data mode ────────────────────────────────────────────────────────
+    if (CFG.dataFile) {
+        console.log(C.cyan(`  Mode: REAL DATA – loading from ${CFG.dataFile}\n`));
+        interface RealMarketEntry {
+            conditionId: string; question: string; yes_p: number;
+            days_left: number; age_days: number; liquidity: number;
+            token_yes: string; token_no: string;
+            startDate: string; endDate: string;
+            history: Array<{ t: number; p: number }>;
+        }
+        const raw: RealMarketEntry[] = JSON.parse(fs.readFileSync(CFG.dataFile, 'utf8'));
+        const subset = raw.slice(0, CFG.markets);
+
+        for (let i = 0; i < subset.length; i++) {
+            const entry = subset[i];
+            const market: MarketInfo = {
+                conditionId: entry.conditionId,
+                tokenId: entry.token_yes,
+                question: entry.question,
+                endDate: entry.endDate ? new Date(entry.endDate) : new Date(Date.now() + 30 * 86400000),
+                startDate: entry.startDate ? new Date(entry.startDate) : new Date(Date.now() - 30 * 86400000),
+            };
+
+            const ticks: PriceTick[] = (entry.history || []).map(h => ({ t: h.t, p: h.p }));
+            const filteredTicks = ticks.filter(
+                (t) => t.p >= CFG.priceRangeMin && t.p <= CFG.priceRangeMax
+            );
+
+            process.stdout.write(
+                C.gray(`[${i + 1}/${subset.length}] `) +
+                C.cyan(market.question.slice(0, 50).padEnd(50)) + ' '
+            );
+
+            if (filteredTicks.length < CFG.emMinObs + 5) {
+                console.log(C.yellow(`⚠  only ${filteredTicks.length} in-range ticks`));
+                continue;
+            }
+
+            const result = simulateMarket(market, filteredTicks);
+            results.push(result);
+
+            const pnlFn = result.totalPnl >= 0 ? C.green : C.red;
+            const regime = result.avgSigma < 0.02 ? 'CALM' : result.avgSigma < 0.06 ? 'NORMAL' : result.avgSigma < 0.10 ? 'VOLATILE' : 'EXTREME';
+            console.log(
+                pnlFn(`${result.totalPnl >= 0 ? '+' : ''}$${result.totalPnl.toFixed(2)}`) +
+                C.gray(` (${filteredTicks.length} ticks, ${result.fills.length} fills, σ=${result.avgSigma.toFixed(3)}, ${regime})`)
+            );
+        }
+
+    } else if (useOffline) {
         console.log(C.yellow(`  Mode: SYNTHETIC (offline) – generating ${CFG.markets} market scenarios\n`));
         const syntheticData = buildSyntheticMarkets(Math.min(CFG.markets, SYNTHETIC_MARKETS.length), CFG.days);
 
@@ -829,7 +886,7 @@ async function main() {
                 console.log(C.red(`✗ ${err.message?.slice(0, 40) ?? err}`));
             }
         }
-    }
+    } // end real/synthetic/live branches
 
     if (results.length === 0) {
         console.error(C.red('\n✗ No markets could be simulated. Check API connectivity.\n'));
