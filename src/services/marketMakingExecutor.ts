@@ -132,24 +132,30 @@ async function recordFill(
         inv.dailyLossDate = today;
     }
 
+    const tokensTraded = sizeUSD / price;
+
     if (side === 'BUY') {
         const newCost = inv.costBasis + sizeUSD;
-        const newPos = inv.netPosition + sizeUSD / price;
+        const newPos = inv.netPosition + tokensTraded;
         inv.avgEntryPrice = newPos > 0 ? newCost / newPos : price;
         inv.netPosition = newPos;
         inv.costBasis = newCost;
         inv.totalFillsBuy += 1;
     } else {
-        const proceeds = sizeUSD;
-        const entryCost = inv.avgEntryPrice * (sizeUSD / price);
-        const pnl = proceeds - entryCost;
+        const entryCost = inv.avgEntryPrice * tokensTraded; // cost basis of tokens being sold
+        const pnl = sizeUSD - entryCost;
         inv.realizedPnl += pnl;
         if (pnl < 0) inv.dailyLoss += Math.abs(pnl);
-        inv.netPosition = Math.max(0, inv.netPosition - sizeUSD / price);
+        inv.netPosition = Math.max(0, inv.netPosition - tokensTraded);
+        inv.costBasis = Math.max(0, inv.costBasis - entryCost); // decrement cost basis for sold tokens
         inv.totalFillsSell += 1;
     }
 
     inv.lastUpdated = new Date();
+    Logger.info(
+        `[MM Inventory] ${conditionId.slice(0, 8)} ${side} fill $${sizeUSD.toFixed(2)} @ ${price.toFixed(3)} | ` +
+        `netPos=${inv.netPosition.toFixed(3)} avgEntry=${inv.avgEntryPrice.toFixed(3)} realizedPnl=${inv.realizedPnl.toFixed(2)}`
+    );
     await inv.save();
 }
 
@@ -316,7 +322,16 @@ async function placeGTCOrder(
             return orderId;
         }
     } catch (err) {
-        Logger.error(`[MM Executor] Place ${side} order failed: ${err}`);
+        // Differentiate fatal vs transient errors so callers can act appropriately
+        const errMsg = String(err).toLowerCase();
+        if (errMsg.includes('401') || errMsg.includes('unauthorized') || errMsg.includes('invalid signature')) {
+            // Auth / signing error — won't recover without operator action
+            Logger.error(`[MM Executor] FATAL: auth/signature error placing ${side} order — check CLOB credentials: ${err}`);
+        } else if (errMsg.includes('insufficient') || errMsg.includes('balance')) {
+            Logger.error(`[MM Executor] Insufficient balance placing ${side} $${sizeUSD}: ${err}`);
+        } else {
+            Logger.error(`[MM Executor] Place ${side} order failed: ${err}`);
+        }
     }
     return null;
 }
@@ -512,26 +527,61 @@ async function reconcileFilledOrders(clobClient: ClobClient): Promise<void> {
             } catch { return []; }
         })();
 
-        const liveIds = new Set(liveOrders.map((o) => o.id));
-        const filledOrders = dbOpenOrders.filter((o) => !liveIds.has(o.orderId));
-        if (filledOrders.length === 0) return;
+        const liveMap = new Map(liveOrders.map((o) => [o.id, o]));
 
-        // Batch-update all filled order statuses in one round-trip
-        await MMOpenOrderModel.bulkWrite(
-            filledOrders.map((o) => ({
-                updateOne: {
-                    filter: { orderId: o.orderId },
-                    update: { $set: { status: 'FILLED', updatedAt: new Date() } },
-                },
-            }))
-        );
+        // (A) Orders no longer in live set → fully filled (or cancelled externally)
+        const filledOrders = dbOpenOrders.filter((o) => !liveMap.has(o.orderId));
 
-        // Record inventory changes in parallel (each fill is independent)
-        await Promise.allSettled(
-            filledOrders.map((o) =>
-                recordFill(o.conditionId, o.side as 'BUY' | 'SELL', o.price, o.sizeUSD)
-            )
-        );
+        // (B) Orders still live but with new tokens matched → incremental partial fill
+        const partialOrders = dbOpenOrders.filter((o) => {
+            const live = liveMap.get(o.orderId);
+            if (!live) return false;
+            const currentMatched = parseFloat(live.size_matched ?? '0');
+            return currentMatched > (o.sizeMatchedTokens ?? 0);
+        });
+
+        // Process (A): fully filled orders
+        if (filledOrders.length > 0) {
+            await MMOpenOrderModel.bulkWrite(
+                filledOrders.map((o) => ({
+                    updateOne: {
+                        filter: { orderId: o.orderId },
+                        update: { $set: { status: 'FILLED', updatedAt: new Date() } },
+                    },
+                }))
+            );
+            // Record only the unmatched portion (remainder not already recorded via partial fills)
+            await Promise.allSettled(
+                filledOrders.map((o) => {
+                    const alreadyMatched = o.sizeMatchedTokens ?? 0;
+                    const remainingTokens = Math.max(0, o.size - alreadyMatched);
+                    const fillUSD = remainingTokens * o.price;
+                    return fillUSD > 0
+                        ? recordFill(o.conditionId, o.side as 'BUY' | 'SELL', o.price, fillUSD)
+                        : Promise.resolve();
+                })
+            );
+            Logger.info(`[MM Executor] Reconciled ${filledOrders.length} fully filled order(s)`);
+        }
+
+        // Process (B): incremental partial fills for still-live orders
+        if (partialOrders.length > 0) {
+            await Promise.allSettled(
+                partialOrders.map(async (o) => {
+                    const live = liveMap.get(o.orderId)!;
+                    const currentMatched = parseFloat(live.size_matched ?? '0');
+                    const incrementTokens = currentMatched - (o.sizeMatchedTokens ?? 0);
+                    if (incrementTokens <= 0) return;
+                    const fillUSD = incrementTokens * o.price;
+                    await recordFill(o.conditionId, o.side as 'BUY' | 'SELL', o.price, fillUSD);
+                    await MMOpenOrderModel.updateOne(
+                        { orderId: o.orderId },
+                        { $set: { status: 'PARTIALLY_FILLED', sizeMatchedTokens: currentMatched, updatedAt: new Date() } }
+                    );
+                })
+            );
+            Logger.info(`[MM Executor] Recorded incremental fills for ${partialOrders.length} partial order(s)`);
+        }
     } catch (err) {
         Logger.error(`[MM Executor] Reconcile error: ${err}`);
     }
@@ -612,15 +662,23 @@ export default async function marketMakingExecutor(clobClient: ClobClient): Prom
     // Cancel any orders left open from a previous session before placing new quotes
     await cancelAllStaleOrders(clobClient);
 
+    // Allow at most (rebalanceInterval - 5s) for each tick before hard timeout.
+    // Prevents a stalled tick from blocking the entire executor indefinitely.
+    const TICK_TIMEOUT_MS = Math.max(10_000, (MM_CFG.rebalanceIntervalSec - 5) * 1000);
+
     const tick = async () => {
         if (!running) return;
+        const timeout = new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error('Executor tick timed out')), TICK_TIMEOUT_MS)
+        );
         try {
-            await executorTick(clobClient);
+            await Promise.race([executorTick(clobClient), timeout]);
         } catch (err) {
             Logger.error(`[MM Executor] Tick error: ${err}`);
-        }
-        if (running) {
-            executorTimer = setTimeout(tick, MM_CFG.rebalanceIntervalSec * 1000);
+        } finally {
+            if (running) {
+                executorTimer = setTimeout(tick, MM_CFG.rebalanceIntervalSec * 1000);
+            }
         }
     };
 

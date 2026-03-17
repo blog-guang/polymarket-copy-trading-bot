@@ -157,6 +157,9 @@ export function computeQuotes(p: QuoteParams): Quotes | null {
     const bid = parseFloat(Math.max(0.01, adjustedMid - halfSpread).toFixed(3));
     const ask = parseFloat(Math.min(0.99, adjustedMid + halfSpread).toFixed(3));
 
+    // Defensive guard: spread collapsed after rounding (can happen if halfSpread < 0.0005)
+    if (bid >= ask) return null;
+
     return {
         bid,
         ask,

@@ -37,8 +37,9 @@ export interface IMMOpenOrder extends Document {
     tokenId: string;
     side: 'BUY' | 'SELL';
     price: number;
-    size: number;             // in tokens
-    sizeUSD: number;          // in USDC
+    size: number;             // in tokens (original order size)
+    sizeUSD: number;          // in USDC (original order size)
+    sizeMatchedTokens: number; // tokens already recorded as filled (for partial fill tracking)
     status: 'OPEN' | 'FILLED' | 'CANCELLED' | 'PARTIALLY_FILLED';
     createdAt: Date;
     updatedAt: Date;
@@ -53,6 +54,7 @@ const MMOpenOrderSchema = new Schema<IMMOpenOrder>(
         price: { type: Number, required: true },
         size: { type: Number, required: true },
         sizeUSD: { type: Number, required: true },
+        sizeMatchedTokens: { type: Number, default: 0 },
         status: {
             type: String,
             enum: ['OPEN', 'FILLED', 'CANCELLED', 'PARTIALLY_FILLED'],
@@ -66,6 +68,7 @@ const MMOpenOrderSchema = new Schema<IMMOpenOrder>(
 );
 
 MMOpenOrderSchema.index({ conditionId: 1, status: 1 });
+MMOpenOrderSchema.index({ updatedAt: -1 });
 
 export const MMOpenOrderModel = mongoose.model<IMMOpenOrder>(
     'MMOpenOrder',
@@ -109,6 +112,8 @@ const MMInventorySchema = new Schema<IMMInventory>(
     },
     { collection: 'mm_inventory' }
 );
+
+MMInventorySchema.index({ dailyLossDate: 1 });
 
 export const MMInventoryModel = mongoose.model<IMMInventory>(
     'MMInventory',
