@@ -192,7 +192,7 @@ export function estimateJumpDiffusion(
     return {
         sigma: Math.max(0.001, sigmaD),
         lambda: Math.max(0.001, lambda),
-        muJump,
+        muJump: muJ,
         sigmaJump: sigmaJ,
         fairValue,
         nObs: prices.length,

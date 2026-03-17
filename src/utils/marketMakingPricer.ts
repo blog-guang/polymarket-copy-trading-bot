@@ -76,7 +76,11 @@ export function computeQuotes(p: QuoteParams): Quotes {
     // ── 2. Spread multiplier (paper's three risk factors) ─────────────────────
     const inventoryRisk = p.riskAversion * q * q;
     const volRisk = p.volSensitivity * p.sigma * p.sigma;
-    const jumpRisk = p.jumpSensitivity * Math.max(0, p.lambda);
+    // λ is normalised to [0,1] before applying sensitivity:
+    //   λ_norm = λ / (λ + 1)  (logistic-style saturation)
+    // This prevents λ >> 1 (high-frequency microstructure noise) from dominating.
+    const lambdaNorm = p.lambda / (p.lambda + 1);
+    const jumpRisk = p.jumpSensitivity * lambdaNorm;
     const spreadMultiplier = 1 + inventoryRisk + volRisk + jumpRisk;
 
     // ── 3. Calendar multiplier (paper §4 – convergence to certainty) ─────────
