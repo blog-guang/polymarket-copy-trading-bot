@@ -115,6 +115,21 @@ interface MarketInfo {
     startDate: Date;
 }
 
+/** Shape of entries in a MM_BACKTEST_DATA_FILE JSON array. */
+interface RealMarketEntry {
+    conditionId: string;
+    question: string;
+    yes_p: number;
+    days_left: number;
+    age_days: number;
+    liquidity: number;
+    token_yes: string;
+    token_no: string;
+    startDate: string;
+    endDate: string;
+    history: Array<{ t: number; p: number }>;
+}
+
 interface FilledOrder {
     tick: number;
     side: 'BUY' | 'SELL';
@@ -768,13 +783,6 @@ async function main() {
     // ── Real data mode ────────────────────────────────────────────────────────
     if (CFG.dataFile) {
         console.log(C.cyan(`  Mode: REAL DATA – loading from ${CFG.dataFile}\n`));
-        interface RealMarketEntry {
-            conditionId: string; question: string; yes_p: number;
-            days_left: number; age_days: number; liquidity: number;
-            token_yes: string; token_no: string;
-            startDate: string; endDate: string;
-            history: Array<{ t: number; p: number }>;
-        }
         const raw: RealMarketEntry[] = JSON.parse(fs.readFileSync(CFG.dataFile, 'utf8'));
         const subset = raw.slice(0, CFG.markets);
 
@@ -808,7 +816,7 @@ async function main() {
             results.push(result);
 
             const pnlFn = result.totalPnl >= 0 ? C.green : C.red;
-            const regime = result.avgSigma < 0.02 ? 'CALM' : result.avgSigma < 0.06 ? 'NORMAL' : result.avgSigma < 0.10 ? 'VOLATILE' : 'EXTREME';
+            const regime = classifyRegime(result.avgSigma);
             console.log(
                 pnlFn(`${result.totalPnl >= 0 ? '+' : ''}$${result.totalPnl.toFixed(2)}`) +
                 C.gray(` (${filteredTicks.length} ticks, ${result.fills.length} fills, σ=${result.avgSigma.toFixed(3)}, ${regime})`)

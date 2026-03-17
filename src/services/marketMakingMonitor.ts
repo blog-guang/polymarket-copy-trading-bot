@@ -16,6 +16,7 @@ import {
     estimateParamsHybrid,
     classifyRegime,
     detectTrend,
+    defaultJumpDiffusionParams,
 } from '../utils/jumpDiffusionModel';
 import { riskAdjustedScore, estimateDailyReward } from '../utils/marketMakingPricer';
 import {
@@ -98,7 +99,11 @@ async function fetchPriceHistory(tokenId: string): Promise<PricePoint[]> {
     return [];
 }
 
-/** Save new price ticks to DB, pruning records older than the configured window */
+/**
+ * Save new price ticks to DB using a single bulkWrite round-trip.
+ * Pruning is intentionally omitted here — call pruneOldPriceHistory() once
+ * per scan cycle instead of once per market.
+ */
 async function savePriceHistory(
     conditionId: string,
     tokenId: string,
@@ -106,31 +111,28 @@ async function savePriceHistory(
 ): Promise<void> {
     if (points.length === 0) return;
 
-    const cutoff = new Date(
-        Date.now() - MM_CFG.priceHistoryWindowHours * 3_600_000
-    );
+    const cutoff = new Date(Date.now() - MM_CFG.priceHistoryWindowHours * 3_600_000);
 
-    // Build upsert-style inserts (skip existing timestamps)
-    const docs = points.map((p) => ({
-        conditionId,
-        tokenId,
-        price: p.p,
-        timestamp: new Date(p.t * 1000),
-    }));
+    const operations = points
+        .map((p) => ({ conditionId, tokenId, price: p.p, timestamp: new Date(p.t * 1000) }))
+        .filter((doc) => doc.timestamp > cutoff)
+        .map((doc) => ({
+            updateOne: {
+                filter: { conditionId, tokenId, timestamp: doc.timestamp },
+                update: { $setOnInsert: doc },
+                upsert: true,
+            },
+        }));
 
-    // Insert only new points (ignore duplicates via try/catch on each)
-    for (const doc of docs) {
-        if (doc.timestamp > cutoff) {
-            await MMPriceHistoryModel.updateOne(
-                { conditionId, tokenId, timestamp: doc.timestamp },
-                { $setOnInsert: doc },
-                { upsert: true }
-            ).catch(() => {/* ignore duplicate key */});
-        }
+    if (operations.length > 0) {
+        await MMPriceHistoryModel.bulkWrite(operations).catch(() => {/* ignore dup key */});
     }
+}
 
-    // Prune old records
-    await MMPriceHistoryModel.deleteMany({ conditionId, timestamp: { $lt: cutoff } });
+/** Prune price history older than the configured window — called once per scan cycle. */
+async function pruneOldPriceHistory(): Promise<void> {
+    const cutoff = new Date(Date.now() - MM_CFG.priceHistoryWindowHours * 3_600_000);
+    await MMPriceHistoryModel.deleteMany({ timestamp: { $lt: cutoff } });
 }
 
 /** Load price history from DB for EM estimation */
@@ -210,17 +212,18 @@ async function scoreAndSaveMarket(market: PolymarketMarket): Promise<number> {
         (t) => t.outcome?.toUpperCase() === 'NO'
     ) ?? market.tokens[1];
 
-    // Fetch & persist price history
-    const rawHistory = await fetchPriceHistory(yesToken.token_id);
+    // Parallelise the two independent CLOB fetches
+    const [rawHistory, livePrice] = await Promise.all([
+        fetchPriceHistory(yesToken.token_id),
+        fetchMidPrice(yesToken.token_id),
+    ]);
     await savePriceHistory(market.condition_id, yesToken.token_id, rawHistory);
 
     // Load from DB (includes previously saved points)
     const { prices, timestamps } = await loadPriceHistory(market.condition_id);
 
-    // Current mid-price
-    let currentPrice = prices.length > 0 ? prices[prices.length - 1] : 0.5;
-    const livePrice = await fetchMidPrice(yesToken.token_id);
-    if (livePrice !== null) currentPrice = livePrice;
+    // Prefer live order-book mid; fall back to last stored price
+    const currentPrice = livePrice ?? (prices.length > 0 ? prices[prices.length - 1] : 0.5);
 
     // Filter check
     if (!passesFilter(market, currentPrice)) return 0;
@@ -228,7 +231,7 @@ async function scoreAndSaveMarket(market: PolymarketMarket): Promise<number> {
     // EM parameter estimation (hybrid: σ from 1-min, λ from hourly resampled)
     const emResult = prices.length >= 5
         ? estimateParamsHybrid(prices, timestamps)
-        : { sigma: 0.05, lambda: 0.1, sigmaTotal: 0.05, fairValue: currentPrice, muJump: 0, sigmaJump: 0.03, nObs: prices.length, converged: false };
+        : defaultJumpDiffusionParams(currentPrice, prices.length);
     const { sigma, lambda, sigmaTotal, fairValue } = emResult;
 
     // Classify regime using sigmaTotal (includes jump risk, not just diffusion)
@@ -323,21 +326,30 @@ async function scanMarkets(): Promise<void> {
         await new Promise((res) => setTimeout(res, 500));
     }
 
-    // Mark only top MM_MARKET_LIMIT as active; deactivate others
-    scored.sort((a, b) => b.score - a.score);
-    const topIds = scored.slice(0, MM_CFG.marketLimit).map((m) => m.conditionId);
+    // Prune old price history once per scan cycle (not per market)
+    await pruneOldPriceHistory();
 
-    await MMMarketModel.updateMany(
-        { conditionId: { $nin: topIds } },
-        { $set: { active: false } }
-    );
-    await MMMarketModel.updateMany(
-        { conditionId: { $in: topIds } },
-        { $set: { active: true } }
-    );
+    // Compute which markets should be active
+    scored.sort((a, b) => b.score - a.score);
+    const topIds = new Set(scored.slice(0, MM_CFG.marketLimit).map((m) => m.conditionId));
+
+    // Single atomic bulkWrite: only touch markets whose state actually changes
+    const allKnown = await MMMarketModel.find({}).select('conditionId active').lean();
+    const stateChanges = allKnown
+        .filter((m) => m.active !== topIds.has(m.conditionId))
+        .map((m) => ({
+            updateOne: {
+                filter: { conditionId: m.conditionId },
+                update: { $set: { active: topIds.has(m.conditionId) } },
+            },
+        }));
+
+    if (stateChanges.length > 0) {
+        await MMMarketModel.bulkWrite(stateChanges);
+    }
 
     Logger.success(
-        `[MM Monitor] Selected ${topIds.length} markets | top score: ${scored[0]?.score?.toFixed(4) ?? 'n/a'}`
+        `[MM Monitor] Selected ${topIds.size} markets | top score: ${scored[0]?.score?.toFixed(4) ?? 'n/a'}`
     );
 }
 

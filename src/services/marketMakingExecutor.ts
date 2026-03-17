@@ -19,6 +19,7 @@ import {
     estimateParamsHybrid,
     classifyRegime,
     detectTrend,
+    defaultJumpDiffusionParams,
     VolatilityRegime,
 } from '../utils/jumpDiffusionModel';
 import {
@@ -90,25 +91,28 @@ async function loadRecentPrices(conditionId: string): Promise<{ prices: number[]
     };
 }
 
-/** Get or create inventory record for a market */
+/** Get or create inventory record atomically (no race condition on first call). */
 async function getInventory(conditionId: string, tokenId: string): Promise<IMMInventory> {
-    let inv = await MMInventoryModel.findOne({ conditionId });
-    if (!inv) {
-        inv = await MMInventoryModel.create({
-            conditionId,
-            tokenId,
-            netPosition: 0,
-            avgEntryPrice: 0,
-            costBasis: 0,
-            realizedPnl: 0,
-            unrealizedPnl: 0,
-            totalFillsBuy: 0,
-            totalFillsSell: 0,
-            lastUpdated: new Date(),
-            dailyLoss: 0,
-            dailyLossDate: todayStr(),
-        });
-    }
+    const inv = await MMInventoryModel.findOneAndUpdate(
+        { conditionId },
+        {
+            $setOnInsert: {
+                conditionId,
+                tokenId,
+                netPosition: 0,
+                avgEntryPrice: 0,
+                costBasis: 0,
+                realizedPnl: 0,
+                unrealizedPnl: 0,
+                totalFillsBuy: 0,
+                totalFillsSell: 0,
+                lastUpdated: new Date(),
+                dailyLoss: 0,
+                dailyLossDate: todayStr(),
+            },
+        },
+        { upsert: true, new: true }
+    );
     return inv;
 }
 
@@ -266,18 +270,19 @@ async function placeGTCOrder(
 
         if (resp?.success || resp?.orderID) {
             const orderId = resp.orderID ?? resp.id ?? `${Date.now()}-${side}`;
-            await MMOpenOrderModel.create({
-                orderId,
-                conditionId: market.conditionId,
-                tokenId,
-                side,
-                price,
-                size: sizeTokens,
-                sizeUSD,
-                status: 'OPEN',
-                createdAt: new Date(),
-                updatedAt: new Date(),
-            });
+            // Upsert instead of create: safe against network-timeout double-placement
+            await MMOpenOrderModel.updateOne(
+                { orderId },
+                {
+                    $set: {
+                        orderId, conditionId: market.conditionId, tokenId,
+                        side, price, size: sizeTokens, sizeUSD,
+                        status: 'OPEN', updatedAt: new Date(),
+                    },
+                    $setOnInsert: { createdAt: new Date() },
+                },
+                { upsert: true }
+            );
             return orderId;
         }
     } catch (err) {
@@ -301,13 +306,15 @@ async function updateQuotesForMarket(
     // 2. Load price history & run hybrid EM (σ from 1-min, λ from hourly)
     const { prices, timestamps } = await loadRecentPrices(market.conditionId);
 
-    // Append current price to history snapshot (in-memory only for EM)
-    const allPrices = [...prices, currentPrice];
-    const allTs = [...timestamps, Date.now()];
+    // Append current price to history snapshot (in-memory only for EM).
+    // Cap at last 2000 points to bound memory allocation per tick.
+    const BASE = Math.max(0, prices.length - 1999);
+    const allPrices = [...prices.slice(BASE), currentPrice];
+    const allTs = [...timestamps.slice(BASE), Date.now()];
 
     const emResult = allPrices.length >= 5
         ? estimateParamsHybrid(allPrices, allTs)
-        : { sigma: 0.05, lambda: 0.1, sigmaTotal: 0.05, fairValue: currentPrice, muJump: 0, sigmaJump: 0.03, nObs: allPrices.length, converged: false };
+        : defaultJumpDiffusionParams(currentPrice, allPrices.length);
     const { sigma, lambda, sigmaTotal, fairValue } = emResult;
 
     // Classify regime and apply hard σ cutoff (using sigmaTotal: includes jump risk)
@@ -417,17 +424,25 @@ async function reconcileFilledOrders(clobClient: ClobClient): Promise<void> {
         })();
 
         const liveIds = new Set(liveOrders.map((o) => o.id));
+        const filledOrders = dbOpenOrders.filter((o) => !liveIds.has(o.orderId));
+        if (filledOrders.length === 0) return;
 
-        for (const order of dbOpenOrders) {
-            if (!liveIds.has(order.orderId)) {
-                // Order no longer open → assume filled
-                await MMOpenOrderModel.updateOne(
-                    { orderId: order.orderId },
-                    { $set: { status: 'FILLED', updatedAt: new Date() } }
-                );
-                await recordFill(order.conditionId, order.side as 'BUY' | 'SELL', order.price, order.sizeUSD);
-            }
-        }
+        // Batch-update all filled order statuses in one round-trip
+        await MMOpenOrderModel.bulkWrite(
+            filledOrders.map((o) => ({
+                updateOne: {
+                    filter: { orderId: o.orderId },
+                    update: { $set: { status: 'FILLED', updatedAt: new Date() } },
+                },
+            }))
+        );
+
+        // Record inventory changes in parallel (each fill is independent)
+        await Promise.allSettled(
+            filledOrders.map((o) =>
+                recordFill(o.conditionId, o.side as 'BUY' | 'SELL', o.price, o.sizeUSD)
+            )
+        );
     } catch (err) {
         Logger.error(`[MM Executor] Reconcile error: ${err}`);
     }
@@ -444,7 +459,7 @@ async function executorTick(clobClient: ClobClient): Promise<void> {
         .find({ active: true })
         .sort({ score: -1 })
         .limit(MM_CFG.marketLimit)
-        .lean() as IMMMarket[];
+        .lean() as unknown as IMMMarket[];
 
     if (markets.length === 0) {
         Logger.info('[MM Executor] No active markets yet – waiting for monitor scan...');

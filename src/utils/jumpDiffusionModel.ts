@@ -46,6 +46,34 @@ export function classifyRegime(sigmaTotal: number): VolatilityRegime {
     return 'EXTREME';
 }
 
+// ── Shared helpers ────────────────────────────────────────────────────────────
+
+/**
+ * Total effective volatility: σ_total = sqrt(σ_D² + λ × σ_J²)
+ * Single source of truth used throughout the codebase.
+ */
+export function computeSigmaTotal(sigma: number, lambda: number, sigmaJump: number): number {
+    return Math.sqrt(sigma ** 2 + lambda * sigmaJump ** 2);
+}
+
+/**
+ * Default JumpDiffusionParams for markets with fewer than 5 observations.
+ * Centralised so executor and monitor always return identical fallback values.
+ */
+export function defaultJumpDiffusionParams(fairValue: number, nObs: number): JumpDiffusionParams {
+    const sigma = 0.05, lambda = 0.1, sigmaJump = 0.03;
+    return {
+        sigma,
+        lambda,
+        muJump: 0,
+        sigmaJump,
+        sigmaTotal: computeSigmaTotal(sigma, lambda, sigmaJump),
+        fairValue,
+        nObs,
+        converged: false,
+    };
+}
+
 // ── Helper math ───────────────────────────────────────────────────────────────
 
 /** logit transform: price → log-odds */
@@ -132,18 +160,10 @@ export function estimateJumpDiffusion(
     maxIter = 50,
     tol = 1e-4
 ): JumpDiffusionParams {
-    const DEFAULT_PARAMS: JumpDiffusionParams = {
-        sigma: 0.05,
-        lambda: 0.1,
-        muJump: 0,
-        sigmaJump: 0.2,
-        sigmaTotal: Math.sqrt(0.05 ** 2 + 0.1 * 0.2 ** 2),
-        fairValue: prices.length > 0 ? prices[prices.length - 1] : 0.5,
-        nObs: prices.length,
-        converged: false,
-    };
-
-    if (prices.length < 5) return DEFAULT_PARAMS;
+    if (prices.length < 5) return defaultJumpDiffusionParams(
+        prices.length > 0 ? prices[prices.length - 1] : 0.5,
+        prices.length
+    );
 
     // ── Step 1: transform to log-odds ─────────────────────────────────────────
     const logOdds = prices.map(logit);
@@ -234,9 +254,7 @@ export function estimateJumpDiffusion(
 
     const sigmaD_final = Math.max(0.001, sigmaD);
     const lambda_final = Math.max(0.001, lambda);
-    // Total effective volatility: σ_total = sqrt(σ_D² + λ × σ_J²)
-    // This correctly captures jump-dominated markets where σ_D ≈ 0 but jumps are large.
-    const sigmaTotal = Math.sqrt(sigmaD_final ** 2 + lambda_final * sigmaJ ** 2);
+    const sigmaTotal = computeSigmaTotal(sigmaD_final, lambda_final, sigmaJ);
 
     return {
         sigma: sigmaD_final,
@@ -360,7 +378,7 @@ export function estimateParamsHybrid(
 
     const lambda_combined = loFreq.lambda;
     // Recompute sigmaTotal using the hourly (more realistic) λ
-    const sigmaTotal = Math.sqrt(hiFreq.sigma ** 2 + lambda_combined * hiFreq.sigmaJump ** 2);
+    const sigmaTotal = computeSigmaTotal(hiFreq.sigma, lambda_combined, hiFreq.sigmaJump);
     return {
         ...hiFreq,
         // Override λ with the hourly estimate (unit: jumps/day)
